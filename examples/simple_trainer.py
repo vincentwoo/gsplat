@@ -38,7 +38,7 @@ from lib_bilagrid import (
 
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
-from gsplat.rendering import rasterization, rasterization_depth_reinit
+from gsplat.rendering import rasterization, rasterization_to_msv2
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
@@ -524,15 +524,15 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
-    def rasterize_depht_init_splats(
+    def rasterize_msv2(
             self,
             camtoworlds: Tensor,
             Ks: Tensor,
             width: int,
             height: int,
-            masks: Optional[Tensor] = None,
+            depth_reinit,
             **kwargs,
-    ) -> Tuple[Tensor, Tensor, Dict]:
+    ):
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -554,25 +554,48 @@ class Runner:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
-        render_alphas, points, info = rasterization_depth_reinit(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            packed=False,
-            absgrad=False,
-            sparse_grad=False,
-            rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            **kwargs,
-        )
-        return render_alphas, points, info
+        if depth_reinit:
+            render_alphas, points, info = rasterization_to_msv2(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=False,
+                absgrad=False,
+                sparse_grad=False,
+                depth_reinit=depth_reinit,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=self.cfg.camera_model,
+                **kwargs,
+            )
+            return render_alphas, points, info
+        else:
+            accum_weights, accum_weights_count, accum_max_count, info = rasterization_to_msv2(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=False,
+                absgrad=False,
+                sparse_grad=False,
+                depth_reinit=depth_reinit,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=self.cfg.camera_model,
+                **kwargs,
+            )
+        return accum_weights, accum_weights_count, accum_max_count, info
 
     def train(self):
         cfg = self.cfg
@@ -1094,7 +1117,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
             Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
 
-            alphas, points, _ = self.rasterize_depht_init_splats(
+            alphas, points, _ = self.rasterize_msv2(
                 camtoworlds=camtoworlds,
                 Ks=Ks_cur,
                 width=width,
@@ -1103,6 +1126,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB",
+                depth_reinit=True,
             )
 
             alphas_2d = alphas[0]  # shape [H, W]

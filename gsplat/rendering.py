@@ -13,6 +13,7 @@ from .cuda._wrapper import (
     isect_offset_encode,
     isect_tiles,
     rasterize_to_pixels,
+    rasterize_to_weights,
     rasterize_to_depth_reinit,
     rasterize_to_pixels_2dgs,
     spherical_harmonics,
@@ -582,7 +583,7 @@ def rasterization(
 
     return render_colors, render_alphas, meta
 
-def rasterization_depth_reinit(
+def rasterization_to_msv2(
         means: Tensor,  # [N, 3]
         quats: Tensor,  # [N, 4]
         scales: Tensor,  # [N, 3]
@@ -592,6 +593,7 @@ def rasterization_depth_reinit(
         Ks: Tensor,  # [C, 3, 3]
         width: int,
         height: int,
+        depth_reinit: bool,
         near_plane: float = 0.01,
         far_plane: float = 1e10,
         radius_clip: float = 0.0,
@@ -608,7 +610,7 @@ def rasterization_depth_reinit(
         distributed: bool = False,
         camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
         covars: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Dict]:
+):
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
     This function provides a handful features for 3D Gaussian rasterization, which
@@ -1081,22 +1083,36 @@ def rasterization_depth_reinit(
         }
     )
 
-    # print("rank", world_rank, "Before rasterize_to_pixels")
-    if colors.shape[-1] > channel_chunk:
-        # slice into chunks
-        n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
-        render_colors, render_alphas = [], []
-        for i in range(n_chunks):
-            colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
-            backgrounds_chunk = (
-                backgrounds[..., i * channel_chunk : (i + 1) * channel_chunk]
-                if backgrounds is not None
-                else None
-            )
-            render_alphas_, points = rasterize_to_depth_reinit(
+    if depth_reinit:
+        if colors.shape[-1] > channel_chunk:
+            # slice into chunks
+            n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
+            render_colors, render_alphas = [], []
+            for i in range(n_chunks):
+                colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
+                render_alphas_, points = rasterize_to_depth_reinit(
+                    means2d,
+                    conics,
+                    colors_chunk,
+                    opacities,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    means=means,
+                    scales=scales,
+                    quats=quats,
+                    Ks=Ks,
+                    viewmats=viewmats,
+                )
+                render_alphas.append(render_alphas_)
+            render_alphas = render_alphas[0]  # discard the rest
+        else:
+            render_alphas, points = rasterize_to_depth_reinit(
                 means2d,
                 conics,
-                colors_chunk,
+                colors,
                 opacities,
                 width,
                 height,
@@ -1109,27 +1125,39 @@ def rasterization_depth_reinit(
                 Ks=Ks,
                 viewmats=viewmats,
             )
-            render_alphas.append(render_alphas_)
-        render_alphas = render_alphas[0]  # discard the rest
-    else:
-        render_alphas, points = rasterize_to_depth_reinit(
-            means2d,
-            conics,
-            colors,
-            opacities,
-            width,
-            height,
-            tile_size,
-            isect_offsets,
-            flatten_ids,
-            means=means,
-            scales=scales,
-            quats=quats,
-            Ks=Ks,
-            viewmats=viewmats,
-        )
 
-    return render_alphas, points, meta
+        return render_alphas, points, meta
+    else:
+        if colors.shape[-1] > channel_chunk:
+            # slice into chunks
+            n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
+            for i in range(n_chunks):
+                colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
+                accum_weights, accum_weights_count, accum_max_count = rasterize_to_weights(
+                    means2d,
+                    conics,
+                    colors_chunk,
+                    opacities,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                )
+        else:
+            accum_weights, accum_weights_count, accum_max_count = rasterize_to_weights(
+                means2d,
+                conics,
+                colors,
+                opacities,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+            )
+
+        return accum_weights, accum_weights_count, accum_max_count, meta
 
 def _rasterization(
     means: Tensor,  # [N, 3]
