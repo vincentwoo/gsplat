@@ -56,7 +56,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/fasnacht"
+    data_dir: str = "/home/paja/data/alex_new"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -190,6 +190,25 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+def write_points_to_ply(filename: str, points: torch.Tensor):
+    """
+    Write a set of 3D points (Nx3) to an ASCII PLY file.
+    """
+    # Ensure the points are on CPU and in NumPy
+    points = points.detach().cpu().numpy()
+
+    with open(filename, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("end_header\n")
+        for i in range(points.shape[0]):
+            x, y, z = points[i]
+            f.write(f"{x} {y} {z}\n")
 
 
 def create_splats_with_optimizers(
@@ -879,7 +898,8 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            #self.depth_reinit()
+            if step % 1000 == 0 and step > 1:
+                self.depth_reinit()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -1059,7 +1079,6 @@ class Runner:
     @torch.no_grad()
     def depth_reinit(self):
         """Entry for trajectory rendering."""
-        print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
 
@@ -1068,25 +1087,51 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        weights = torch.zeros_like(self.splats["opacities"])
-        print("depth_reinit")
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
+        all_points = []
 
-            alphas, points, _ = self.rasterize_depht_init_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB",
-                collect_weights=True,
-                weights=weights,
-            )  # [1, H, W, 4]
+        for i in tqdm.trange(len(camtoworlds_all), desc="depth_reinit"):
+            if i in [14, 25, 35, 45, 55]:
+                camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
+                Ks = K[None]  # shape [1, 3, 3] or [1, 4, 4]
 
+                alphas, points, _ = self.rasterize_depht_init_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB",
+                )
+
+                # Flatten
+                points_flat = points.view(-1, 3)
+                all_points.append(points_flat)
+            else:
+                continue
+
+        # Combine into one [N, 3] tensor
+        #all_points.append(self.splats["means"])
+        all_points = torch.cat(all_points, dim=0)
+        print(f"Total points collected: {all_points.shape[0]}")
+
+        # Optional: remove NaNs / Inf
+        mask = torch.isfinite(all_points).all(dim=-1)
+        all_points = all_points[mask]
+
+        # Remove duplicates by rounding (example approach):
+        import numpy as np
+        pts_np = all_points.detach().cpu().numpy()
+        pts_rounded = pts_np.round(decimals=5)
+        unique_pts_rounded = np.unique(pts_rounded, axis=0)
+        unique_points = torch.from_numpy(unique_pts_rounded).to(all_points.device)
+        print(f"Total points after deduplication: {unique_points.shape[0]}")
+
+        # Write PLY
+        output_ply_path = "output.ply"
+        write_points_to_ply(output_ply_path, unique_points)
+        print(f"Saved PLY: {output_ply_path}")
 
     @torch.no_grad()
     def run_compression(self, step: int):
