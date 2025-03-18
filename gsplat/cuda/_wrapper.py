@@ -437,7 +437,7 @@ def isect_offset_encode(
         isect_ids.contiguous(), n_cameras, tile_width, tile_height
     )
 
-def rasterize_to_depth_reninit(
+def rasterize_to_depth_reinit(
         means2d: Tensor,  # [C, N, 2] or [nnz, 2]
         conics: Tensor,  # [C, N, 3] or [nnz, 3]
         colors: Tensor,  # [C, N, channels] or [nnz, channels]

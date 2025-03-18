@@ -13,7 +13,7 @@ from .cuda._wrapper import (
     isect_offset_encode,
     isect_tiles,
     rasterize_to_pixels,
-    rasterize_to_depth_reninit,
+    rasterize_to_depth_reinit,
     rasterize_to_pixels_2dgs,
     spherical_harmonics,
 )
@@ -1093,7 +1093,7 @@ def rasterization_depth_reinit(
                 if backgrounds is not None
                 else None
             )
-            render_alphas_, points = rasterize_to_depth_reninit(
+            render_alphas_, points = rasterize_to_depth_reinit(
                 means2d,
                 conics,
                 colors_chunk,
@@ -1112,7 +1112,7 @@ def rasterization_depth_reinit(
             render_alphas.append(render_alphas_)
         render_alphas = render_alphas[0]  # discard the rest
     else:
-        render_alphas, points = rasterize_to_depth_reninit(
+        render_alphas, points = rasterize_to_depth_reinit(
             means2d,
             conics,
             colors,
