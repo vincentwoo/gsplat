@@ -126,3 +126,4 @@ data
 results
 
 !examples/benchmarks/compression/results/
+*.ply

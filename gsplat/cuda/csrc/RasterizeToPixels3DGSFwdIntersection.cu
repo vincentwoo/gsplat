@@ -48,6 +48,20 @@ struct vec3 {
  *   debug_out[pix_id*16 + 10..12]= ray_dir (x,y,z)
  *   debug_out[pix_id*16 + 13..15]= placeholders or extra usage
  */
+/**
+ * A small helper: convert from NDC (-1..1) to pixel coords.
+ * Exactly as requested:
+ */
+__forceinline__ __device__ float ndc2Pix(float v, int S)
+{
+    // ((v + 1) * S - 1) * 0.5
+    return ((v + 1.0f) * S - 1.0f) * 0.5f;
+}
+
+/**
+ * Kernel: forward intersection for 3D Gaussians.
+ * Now it also writes debug info (16 floats per pixel) into `debug_out`.
+ */
 template <uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // Number of cameras (C) and number of gaussians (N) if not packed:
@@ -109,9 +123,14 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     out_pts        += camera_id * (image_height * image_width * 3);
     debug_out      += camera_id * (image_height * image_width * 16);
 
-    // Pixel coords (center = +0.5 offset).
-    float px = (float)j + 0.5f;
-    float py = (float)i + 0.5f;
+    // Convert (i, j) to an NDC coordinate, then back to pixel coords
+    // so that we replicate the 'ndc2Pix' usage exactly.
+    float ndc_x = (2.f*(float)j + 1.f) / (float)image_width  - 1.f;
+    float ndc_y = (2.f*(float)i + 1.f) / (float)image_height - 1.f;
+
+    float px = ndc2Pix(ndc_x, image_width);
+    float py = ndc2Pix(ndc_y, image_height);
+
     int32_t pix_id = i * image_width + j;
 
     bool inside = (i < image_height && j < image_width);
@@ -134,8 +153,10 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     vec3 *xy_opacity_batch = reinterpret_cast<vec3*>(&id_batch[block_sz]);
     vec3 *conic_batch      = reinterpret_cast<vec3*>(&xy_opacity_batch[block_sz]);
 
-    // Initialize partial color & alpha
+    // Initialize partial alpha
     float T = 1.f;
+
+    // Initialize partial color
     float pix_out[CDIM];
     #pragma unroll
     for (uint32_t cc = 0; cc < CDIM; cc++) {
@@ -174,7 +195,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     float len_dir = sqrtf(dx*dx + dy*dy + dz*dz + 1e-12f);
     float3 ray_dir = { dx/len_dir, dy/len_dir, dz/len_dir };
 
-    // Track best intersection
+    // Track best intersection info
     float weight_max = 0.f;
     float3 best_point = {0.f, 0.f, 0.f};
     int best_id = -1;
@@ -184,11 +205,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // Iterate over tile gaussians in batches
     uint32_t tr = block.thread_rank();
     for (uint32_t b = 0; b < num_batches; b++) {
+        // If entire block is done, break
         if (__syncthreads_count(done) >= block_sz) {
             break;
         }
 
-        // Load batch
+        // Load this batch into shared
         uint32_t batch_start = range_start + block_sz*b;
         uint32_t idx = batch_start + tr;
         if (idx < (uint32_t)range_end) {
@@ -199,7 +221,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float opac= (float)opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
 
-            conic_batch[tr] = conics[g];
+            conic_batch[tr] = conics[g]; // (A,B,C)
         }
         block.sync();
 
@@ -209,31 +231,36 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             const vec3 &xyo  = xy_opacity_batch[t]; // (x,y,opac)
             float opac       = xyo.z;
 
-            // 2D footprint
+            // 2D elliptical footprint
             float dx_ = xyo.x - px;
             float dy_ = xyo.y - py;
+            // sigma = 0.5*(A*x^2 + C*y^2) + B*x*y
             float sigma = 0.5f*(co.x*dx_*dx_ + co.z*dy_*dy_) + co.y*(dx_*dy_);
 
+            // alpha = opac * exp(-sigma)
             float alpha = fminf(0.999f, opac*__expf(-sigma));
             if (sigma < 0.f || alpha < 1.f/255.f) {
                 continue;
             }
-            float vis = alpha*T;
+            float vis = alpha * T;
             T *= (1.f - alpha);
 
+            // Accumulate color (if inside image)
             if (inside) {
                 int32_t g = id_batch[t];
                 const float* c_ptr = colors + g*CDIM;
                 #pragma unroll
                 for (uint32_t kk = 0; kk < CDIM; kk++) {
-                    pix_out[kk] += c_ptr[kk]*vis;
+                    pix_out[kk] += c_ptr[kk] * vis;
                 }
             }
+
+            // If almost fully opaque, set done
             if (T <= 1e-4f) {
                 done = true;
             }
 
-            // 3D intersection
+            // 3D intersection test
             int32_t g = id_batch[t];
             float mx = (float)means3D[g*3 + 0];
             float my = (float)means3D[g*3 + 1];
@@ -254,15 +281,15 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float xy2= qx*y2, xz2= qx*z2, yz2= qy*z2;
             float rz2= qr*z2, ry2= qr*y2, rx2= qr*x2;
 
-            float Rm00=1.f-(yy2+zz2);
-            float Rm01=xy2-rz2;
-            float Rm02=xz2+ry2;
-            float Rm10=xy2+rz2;
-            float Rm11=1.f-(xx2+zz2);
-            float Rm12=yz2-rx2;
-            float Rm20=xz2-ry2;
-            float Rm21=yz2+rx2;
-            float Rm22=1.f-(xx2+yy2);
+            float Rm00=1.f - (yy2 + zz2);
+            float Rm01=xy2 - rz2;
+            float Rm02=xz2 + ry2;
+            float Rm10=xy2 + rz2;
+            float Rm11=1.f - (xx2 + zz2);
+            float Rm12=yz2 - rx2;
+            float Rm20=xz2 - ry2;
+            float Rm21=yz2 + rx2;
+            float Rm22=1.f - (xx2 + yy2);
 
             float ox = ray_origin.x - mx;
             float oy = ray_origin.y - my;
@@ -276,12 +303,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float dY = Rm10*ray_dir.x + Rm11*ray_dir.y + Rm12*ray_dir.z;
             float dZ = Rm20*ray_dir.x + Rm21*ray_dir.y + Rm22*ray_dir.z;
 
-            float invsx=1.f/(sx*3.f);
-            float invsy=1.f/(sy*3.f);
-            float invsz=1.f/(sz*3.f);
+            float invsx = 1.f/(sx*3.f);
+            float invsy = 1.f/(sy*3.f);
+            float invsz = 1.f/(sz*3.f);
 
-            float ooX=oX*invsx, ooY=oY*invsy, ooZ=oZ*invsz;
-            float ddX=dX*invsx, ddY=dY*invsy, ddZ=dZ*invsz;
+            float ooX = oX*invsx, ooY = oY*invsy, ooZ = oZ*invsz;
+            float ddX = dX*invsx, ddY = dY*invsy, ddZ = dZ*invsz;
 
             float A = ddX*ddX + ddY*ddY + ddZ*ddZ;
             float B = 2.f*(ddX*ooX + ddY*ooY + ddZ*ooZ);
@@ -292,22 +319,22 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
                 float sqrt_disc = sqrtf(disc);
                 float t1 = (-B - sqrt_disc) / (2.f * A);
                 float t2 = (-B + sqrt_disc) / (2.f * A);
-
                 // pick the smaller positive root
                 float t_ = -1.f;
-                if (t1>0.f && t2>0.f) t_ = fminf(t1,t2);
+                if (t1>0.f && t2>0.f) t_ = fminf(t1, t2);
                 else if (t1>0.f)     t_ = t1;
                 else if (t2>0.f)     t_ = t2;
+
                 if (t_ > 0.f) {
-                    float candidate_weight=vis;
-                    if (candidate_weight>weight_max) {
-                        weight_max  = candidate_weight;
-                        best_point.x= ray_origin.x + t_*ray_dir.x;
-                        best_point.y= ray_origin.y + t_*ray_dir.y;
-                        best_point.z= ray_origin.z + t_*ray_dir.z;
-                        best_id     = g;
-                        best_disc   = disc;
-                        best_t      = t_;
+                    float candidate_weight = vis;
+                    if (candidate_weight > weight_max) {
+                        weight_max = candidate_weight;
+                        best_point.x = ray_origin.x + t_*ray_dir.x;
+                        best_point.y = ray_origin.y + t_*ray_dir.y;
+                        best_point.z = ray_origin.z + t_*ray_dir.z;
+                        best_id      = g;
+                        best_disc    = disc;
+                        best_t       = t_;
                     }
                 }
             }
@@ -322,7 +349,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
         out_pts[pix_id*3 + 1] = (scalar_t)best_point.y;
         out_pts[pix_id*3 + 2] = (scalar_t)best_point.z;
 
-        // Write debug: 16 floats
+        // Write debug: 16 floats per pixel
         float* dbg = debug_out + (pix_id*16);
         dbg[0]  = (float)best_id;
         dbg[1]  = best_disc;
@@ -342,7 +369,6 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
         dbg[15] = -1.f;
     }
 }
-
 
 /**
  * Host launcher: sets up the CUDA grid & dynamic shared mem, calls the kernel,
@@ -448,46 +474,46 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     float* h_debug_out = (float*)malloc(debug_size);
     cudaMemcpy(h_debug_out, d_debug_out, debug_size, cudaMemcpyDeviceToHost);
 
-    printf("\n=== Debug Info (partial) ===\n");
-    printf("C=%d, H=%d, W=%d, debug=16 floats per pixel\n",
-           (int)C, (int)image_height, (int)image_width);
+    //printf("\n=== Debug Info (partial) ===\n");
+    //printf("C=%d, H=%d, W=%d, debug=16 floats per pixel\n",
+    //       (int)C, (int)image_height, (int)image_width);
 
-    // Print up to 2 cameras, 4×4 region
-    int max_cam = (C<2)?(int)C:2;
-    int max_i   = (image_height<4)?(int)image_height:4;
-    int max_j   = (image_width<4)?(int)image_width:4;
+    //// Print up to 2 cameras, 4×4 region
+    //int max_cam = (C<2)?(int)C:2;
+    //int max_i   = (image_height<4)?(int)image_height:4;
+    //int max_j   = (image_width<4)?(int)image_width:4;
 
-    for (int c = 0; c < max_cam; c++) {
-      for (int i = 0; i < max_i; i++) {
-        for (int j = 0; j < max_j; j++) {
-          size_t pix_id = (size_t)c*image_height*image_width + i*image_width + j;
-          const float* dbg = &h_debug_out[pix_id*16];
-          int   best_id   = (int)dbg[0];
-          float best_disc = dbg[1];
-          float best_t    = dbg[2];
-          float bx        = dbg[3];
-          float by        = dbg[4];
-          float bz        = dbg[5];
-          float w         = dbg[6];
-          float ox        = dbg[7];
-          float oy        = dbg[8];
-          float oz        = dbg[9];
-          float dx        = dbg[10];
-          float dy        = dbg[11];
-          float dz        = dbg[12];
+    //for (int c = 0; c < max_cam; c++) {
+    //  for (int i = 0; i < max_i; i++) {
+    //    for (int j = 0; j < max_j; j++) {
+    //      size_t pix_id = (size_t)c*image_height*image_width + i*image_width + j;
+    //      const float* dbg = &h_debug_out[pix_id*16];
+    //      int   best_id   = (int)dbg[0];
+    //      float best_disc = dbg[1];
+    //      float best_t    = dbg[2];
+    //      float bx        = dbg[3];
+    //      float by        = dbg[4];
+    //      float bz        = dbg[5];
+    //      float w         = dbg[6];
+    //      float ox        = dbg[7];
+    //      float oy        = dbg[8];
+    //      float oz        = dbg[9];
+    //      float dx        = dbg[10];
+    //      float dy        = dbg[11];
+    //      float dz        = dbg[12];
 
-          printf("[cam=%d, i=%d, j=%d]: bestID=%d, disc=%.3f, t=%.3f, w=%.3f\n"
-                 "   best_point=(%.3f,%.3f,%.3f)\n"
-                 "   ray_origin=(%.3f,%.3f,%.3f), ray_dir=(%.3f,%.3f,%.3f)\n",
-                 c, i, j,
-                 best_id, best_disc, best_t, w,
-                 bx, by, bz,
-                 ox, oy, oz,
-                 dx, dy, dz);
-        }
-      }
-    }
-    printf("=== End Debug Info ===\n\n");
+    //      printf("[cam=%d, i=%d, j=%d]: bestID=%d, disc=%.3f, t=%.3f, w=%.3f\n"
+    //             "   best_point=(%.3f,%.3f,%.3f)\n"
+    //             "   ray_origin=(%.3f,%.3f,%.3f), ray_dir=(%.3f,%.3f,%.3f)\n",
+    //             c, i, j,
+    //             best_id, best_disc, best_t, w,
+    //             bx, by, bz,
+    //             ox, oy, oz,
+    //             dx, dy, dz);
+    //    }
+    //  }
+    //}
+    //printf("=== End Debug Info ===\n\n");
 
     // 6) Free memory
     free(h_debug_out);
