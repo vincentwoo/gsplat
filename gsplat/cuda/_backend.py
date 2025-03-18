@@ -1,3 +1,9 @@
+""" 
+Trigger compiling (for debugging):
+
+VERBOSE=1 FAST_COMPILE=1 TORCH_CUDA_ARCH_LIST="8.9" python -c "from gsplat.cuda._backend import _C"
+"""
+
 import glob
 import json
 import os
@@ -5,9 +11,11 @@ import shutil
 import time
 from subprocess import DEVNULL, call
 
+import torch
+from packaging import version
 from rich.console import Console
+from torch.utils.cpp_extension import _find_cuda_home  # <--- For robust CUDA detection
 from torch.utils.cpp_extension import (
-    _find_cuda_home,          # <--- For robust CUDA detection
     _TORCH_PATH,
     _check_and_build_extension_h_precompiler_headers,
     _get_build_directory,
@@ -26,6 +34,10 @@ if not MAX_JOBS:
     need_to_unset_max_jobs = True
     os.environ["MAX_JOBS"] = "10"
 
+# torch has bugs on precompiled headers before 2.2, see:
+# https://github.com/nerfstudio-project/gsplat/pull/583#issuecomment-2732597080
+USE_PRECOMPILED_HEADERS = version.parse(torch.__version__) >= version.parse("2.2")
+
 
 def load_extension(
     name,
@@ -36,7 +48,6 @@ def load_extension(
     extra_include_paths=None,
     build_directory=None,
     verbose=False,
-    use_pch=True,
 ):
     """Load a JIT compiled extension."""
     # Make sure the build directory exists.
@@ -48,7 +59,7 @@ def load_extension(
     # https://github.com/pytorch/pytorch/blob/e3513fb2af7951ddf725d8c5b6f6d962a053c9da/torch/utils/cpp_extension.py#L1736
     # But it's ok so we catch this exception and ignore it.
     try:
-        if use_pch:
+        if USE_PRECOMPILED_HEADERS:
             # Using PreCompiled Header('torch/extension.h') to reduce compile time.
             _check_and_build_extension_h_precompiler_headers(
                 extra_cflags, extra_include_paths
@@ -76,6 +87,7 @@ def load_extension(
         # The module should already be compiled if we get OSError
         return _import_module_from_library(name, build_directory, True)
 
+
 def cuda_toolkit_available():
     """
     Check more robustly if the CUDA toolkit is available.
@@ -96,6 +108,7 @@ def cuda_toolkit_available():
         except FileNotFoundError:
             return False
     return True
+
 
 def cuda_toolkit_version():
     """Get the CUDA toolkit version if we found CUDA home."""
