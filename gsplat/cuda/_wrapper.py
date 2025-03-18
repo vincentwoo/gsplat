@@ -437,6 +437,106 @@ def isect_offset_encode(
         isect_ids.contiguous(), n_cameras, tile_width, tile_height
     )
 
+def rasterize_to_weights(
+        means2d: Tensor,  # [C, N, 2] or [nnz, 2]
+        conics: Tensor,  # [C, N, 3] or [nnz, 3]
+        colors: Tensor,  # [C, N, channels] or [nnz, channels]
+        opacities: Tensor,  # [C, N] or [nnz]
+        image_width: int,
+        image_height: int,
+        tile_size: int,
+        isect_offsets: Tensor,  # [C, tile_height, tile_width]
+        flatten_ids: Tensor,  # [n_isects]
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Rasterizes Gaussians to pixels.
+
+    Args:
+        means2d: Projected Gaussian means. [C, N, 2] if packed is False, [nnz, 2] if packed is True.
+        conics: Inverse of the projected covariances with only upper triangle values. [C, N, 3] if packed is False, [nnz, 3] if packed is True.
+        colors: Gaussian colors or ND features. [C, N, channels] if packed is False, [nnz, channels] if packed is True.
+        opacities: Gaussian opacities that support per-view values. [C, N] if packed is False, [nnz] if packed is True.
+        image_width: Image width.
+        image_height: Image height.
+        tile_size: Tile size.
+        isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [C, tile_height, tile_width]
+        flatten_ids: The global flatten indices in [C * N] or [nnz] from  `isect_tiles()`. [n_isects]
+        backgrounds: Background colors. [C, channels]. Default: None.
+        masks: Optional tile mask to skip rendering GS to masked tiles. [C, tile_height, tile_width]. Default: None.
+        packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
+        absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+
+    Returns:
+        A tuple:
+
+        - **Rendered colors**. [C, image_height, image_width, channels]
+        - **Rendered alphas**. [C, image_height, image_width, 1]
+    """
+
+    C = isect_offsets.size(0)
+    device = means2d.device
+    N = means2d.size(1)
+    assert means2d.shape == (C, N, 2), means2d.shape
+    assert conics.shape == (C, N, 3), conics.shape
+    assert colors.shape[:2] == (C, N), colors.shape
+    assert opacities.shape == (C, N), opacities.shape
+
+    # Pad the channels to the nearest supported number if necessary
+    channels = colors.shape[-1]
+    if channels > 513 or channels == 0:
+        # TODO: maybe worth to support zero channels?
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (
+            1,
+            2,
+            3,
+            4,
+            5,
+            8,
+            9,
+            16,
+            17,
+            32,
+            33,
+            64,
+            65,
+            128,
+            129,
+            256,
+            257,
+            512,
+            513,
+    ):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors,
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device),
+            ],
+            dim=-1,
+        )
+
+    tile_height, tile_width = isect_offsets.shape[1:3]
+    assert (
+            tile_height * tile_size >= image_height
+    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    assert (
+            tile_width * tile_size >= image_width
+    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+
+    accum_weights, accum_weights_count, accum_max_count = collect_weights(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+
+    return accum_weights, accum_weights_count, accum_max_count
+
 def rasterize_to_depth_reinit(
         means2d: Tensor,  # [C, N, 2] or [nnz, 2]
         conics: Tensor,  # [C, N, 3] or [nnz, 3]
@@ -984,6 +1084,34 @@ class _FullyFusedProjection(torch.autograd.Function):
             None,
             None,
         )
+
+def collect_weights(
+        means2d: Tensor,  # [C, N, 2]
+        conics: Tensor,  # [C, N, 3]
+        colors: Tensor,  # [C, N, D]
+        opacities: Tensor,  # [C, N]
+        width: int,
+        height: int,
+        tile_size: int,
+        isect_offsets: Tensor,  # [C, tile_height, tile_width]
+        flatten_ids: Tensor,  # [n_isects]
+) -> Tuple[Tensor, Tensor, Tensor]:
+
+    accum_weights, accum_weights_count, accum_max_count = _make_lazy_cuda_func(
+        "rasterize_to_pixels_3dgs_fwd_collect_weights"
+    )(
+        means2d,
+        conics,
+        colors,
+        opacities,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+    )
+
+    return accum_weights, accum_weights_count, accum_max_count
 
 def depth_reinit(
         means2d: Tensor,  # [C, N, 2]
