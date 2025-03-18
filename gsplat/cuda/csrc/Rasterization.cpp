@@ -46,15 +46,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_coll
     uint32_t C = tile_offsets.size(0);    // number of cameras
     uint32_t channels = colors.size(-1);  // last dimension is color channels
 
-    // Prepare output tensors for per-Gaussian accumulations.
-    // According to the new interface, these should be the same size
-    // as 'flatten_ids' (i.e. [n_isects]) or match your "nnz" shape.
     at::Tensor accum_weights =
-        at::zeros({flatten_ids.size(0)}, means2d.options());
+        at::zeros({means2d.size(1)}, means2d.options());
     at::Tensor accum_weights_count =
-        at::zeros({flatten_ids.size(0)}, means2d.options().dtype(at::kInt));
+        at::zeros({means2d.size(1)}, means2d.options().dtype(at::kInt));
     at::Tensor accum_max_count =
-        at::zeros({flatten_ids.size(0)}, means2d.options());
+        at::zeros({means2d.size(1)}, means2d.options());
 
     // Dispatch to the correct template instantiation based on 'channels'
 #define __LAUNCH_KERNEL__(N)                                                   \

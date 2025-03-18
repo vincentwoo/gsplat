@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import string
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -163,7 +164,7 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
-
+    imp_metric: string = "outdoor"
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -921,8 +922,9 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            if step % 1000 == 0 and step > 1:
-                self.depth_reinit()
+            if step % 100 == 0 and step > 1:
+                self.intersection_preserving()
+                #self.depth_reinit()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -1098,6 +1100,67 @@ class Runner:
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
+    @torch.no_grad()
+    @torch.no_grad()
+    def intersection_preserving(self):
+        """Entry for trajectory rendering."""
+
+        device = self.device
+
+        imp_score = torch.zeros(self.splats["means"].shape[0], device=device)
+        accum_area_max = torch.zeros(self.splats["means"].shape[0], device=device)
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        for i in tqdm.trange(len(camtoworlds_all), desc="intersection_preserving"):
+            camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
+            Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
+
+            accum_weights, accum_weights_count, accum_max_count,_ = self.rasterize_msv2(
+                camtoworlds=camtoworlds,
+                Ks=Ks_cur,
+                width=width,
+                height=height,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
+                render_mode="RGB",
+                depth_reinit=False,
+            )
+
+            area_proj = accum_weights_count
+            area_max = accum_max_count
+
+            accum_area_max += area_max
+
+            # Implement importance logic based on 'outdoor' or otherwise
+            if self.cfg.imp_metric == 'outdoor':
+                mask_t = (area_max != 0)
+                # Avoid division by zero
+                temp = imp_score + accum_weights / area_proj.clamp_min(1e-8)
+                imp_score[mask_t] = temp[mask_t]
+            else:
+                imp_score += accum_weights
+
+        # Zero out any points that never contributed
+        def init_cdf_mask(importance, thres=1.0):
+            importance = importance.flatten()
+            if thres != 1.0:
+                percent_sum = thres
+                vals, idx = torch.sort(importance + (1e-6))
+                cumsum_val = torch.cumsum(vals, dim=0)
+                split_index = ((cumsum_val / vals.sum()) > (1 - percent_sum)).nonzero().min()
+                split_val_nonprune = vals[split_index]
+
+                non_prune_mask = importance > split_val_nonprune
+            else:
+                non_prune_mask = torch.ones_like(importance).bool()
+
+            return non_prune_mask
+        non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99)
 
     @torch.no_grad()
     def depth_reinit(self):
@@ -1162,11 +1225,9 @@ class Runner:
             all_points.append(sampled_points)
 
         if len(all_points) > 0:
-            all_points_merged = torch.cat(all_points, dim=0)
+            all_points = torch.cat(all_points, dim=0)
         else:
-            all_points_merged = torch.empty(0, 3, device=device)
-
-        return all_points_merged
+            all_points = torch.empty(0, 3, device=device)
 
         print(f"Total points collected: {all_points.shape[0]}")
 
