@@ -1,15 +1,3 @@
-/*****************************************************************************
- * Rasterize3DGS.cu
- * ---------------------------------------------------------------------------
- * Implements a forward intersection kernel for 3D Gaussians (or ellipsoids)
- * that have already been projected into 2D. This version uses perspective
- * camera models given by extrinsic (4×4) and intrinsic (3×3) matrices.
- *
- * We now add a debug array allocated with cudaMalloc (raw pointer),
- * store 16 floats of debug info per pixel in the kernel, then copy
- * it back to the host & print immediately after the kernel.
- *****************************************************************************/
-
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
@@ -24,8 +12,7 @@ namespace gsplat {
 namespace cg = cooperative_groups;
 
 /**
- * Minimal vector structs for convenience (feel free to replace these with
- * float2 / float3 from CUDA headers or your own library).
+ * Minimal vector structs for convenience
  */
 struct vec2 {
     float x, y;
@@ -50,7 +37,6 @@ struct vec3 {
  */
 /**
  * A small helper: convert from NDC (-1..1) to pixel coords.
- * Exactly as requested:
  */
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
@@ -370,10 +356,6 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     }
 }
 
-/**
- * Host launcher: sets up the CUDA grid & dynamic shared mem, calls the kernel,
- * then copies debug info to CPU and prints a small region immediately.
- */
 template <uint32_t CDIM>
 void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // 2D splat inputs
@@ -473,49 +455,52 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // 5) Copy debug data to host + print partial
     float* h_debug_out = (float*)malloc(debug_size);
     cudaMemcpy(h_debug_out, d_debug_out, debug_size, cudaMemcpyDeviceToHost);
+    bool debug = false;
+    if (debug) {
 
-    //printf("\n=== Debug Info (partial) ===\n");
-    //printf("C=%d, H=%d, W=%d, debug=16 floats per pixel\n",
-    //       (int)C, (int)image_height, (int)image_width);
+        printf("\n=== Debug Info (partial) ===\n");
+        printf("C=%d, H=%d, W=%d, debug=16 floats per pixel\n",
+               (int)C, (int)image_height, (int)image_width);
 
-    //// Print up to 2 cameras, 4×4 region
-    //int max_cam = (C<2)?(int)C:2;
-    //int max_i   = (image_height<4)?(int)image_height:4;
-    //int max_j   = (image_width<4)?(int)image_width:4;
+        // Print up to 2 cameras, 4×4 region
+        int max_cam = (C<2)?(int)C:2;
+        int max_i   = (image_height<4)?(int)image_height:4;
+        int max_j   = (image_width<4)?(int)image_width:4;
 
-    //for (int c = 0; c < max_cam; c++) {
-    //  for (int i = 0; i < max_i; i++) {
-    //    for (int j = 0; j < max_j; j++) {
-    //      size_t pix_id = (size_t)c*image_height*image_width + i*image_width + j;
-    //      const float* dbg = &h_debug_out[pix_id*16];
-    //      int   best_id   = (int)dbg[0];
-    //      float best_disc = dbg[1];
-    //      float best_t    = dbg[2];
-    //      float bx        = dbg[3];
-    //      float by        = dbg[4];
-    //      float bz        = dbg[5];
-    //      float w         = dbg[6];
-    //      float ox        = dbg[7];
-    //      float oy        = dbg[8];
-    //      float oz        = dbg[9];
-    //      float dx        = dbg[10];
-    //      float dy        = dbg[11];
-    //      float dz        = dbg[12];
+        for (int c = 0; c < max_cam; c++) {
+          for (int i = 0; i < max_i; i++) {
+            for (int j = 0; j < max_j; j++) {
+              size_t pix_id = (size_t)c*image_height*image_width + i*image_width + j;
+              const float* dbg = &h_debug_out[pix_id*16];
+              int   best_id   = (int)dbg[0];
+              float best_disc = dbg[1];
+              float best_t    = dbg[2];
+              float bx        = dbg[3];
+              float by        = dbg[4];
+              float bz        = dbg[5];
+              float w         = dbg[6];
+              float ox        = dbg[7];
+              float oy        = dbg[8];
+              float oz        = dbg[9];
+              float dx        = dbg[10];
+              float dy        = dbg[11];
+              float dz        = dbg[12];
 
-    //      printf("[cam=%d, i=%d, j=%d]: bestID=%d, disc=%.3f, t=%.3f, w=%.3f\n"
-    //             "   best_point=(%.3f,%.3f,%.3f)\n"
-    //             "   ray_origin=(%.3f,%.3f,%.3f), ray_dir=(%.3f,%.3f,%.3f)\n",
-    //             c, i, j,
-    //             best_id, best_disc, best_t, w,
-    //             bx, by, bz,
-    //             ox, oy, oz,
-    //             dx, dy, dz);
-    //    }
-    //  }
-    //}
-    //printf("=== End Debug Info ===\n\n");
+              printf("[cam=%d, i=%d, j=%d]: bestID=%d, disc=%.3f, t=%.3f, w=%.3f\n"
+                     "   best_point=(%.3f,%.3f,%.3f)\n"
+                     "   ray_origin=(%.3f,%.3f,%.3f), ray_dir=(%.3f,%.3f,%.3f)\n",
+                     c, i, j,
+                     best_id, best_disc, best_t, w,
+                     bx, by, bz,
+                     ox, oy, oz,
+                     dx, dy, dz);
+            }
+          }
+        }
+        printf("=== End Debug Info ===\n\n");
+    }
 
-    // 6) Free memory
+    // 6) Free memory; We let it here for now: TODO: remove this memory stuff
     free(h_debug_out);
     cudaFree(d_debug_out);
 }

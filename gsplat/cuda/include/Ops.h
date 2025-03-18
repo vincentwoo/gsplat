@@ -213,6 +213,23 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
     const at::optional<at::Tensor> v_precis  // [N, 3, 3] or [N, 6]
 );
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_collect_weights(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
+    const at::Tensor colors,    // [C, N, channels] or [nnz, channels]
+    const at::Tensor opacities, // [C, N]  or [nnz]
+
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+);
+
 // Rasterize 3D Gaussian to pixels
 std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // 2D Gaussian footprints

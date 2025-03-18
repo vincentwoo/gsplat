@@ -15,6 +15,94 @@ namespace gsplat {
 ////////////////////////////////////////////////////
 // 3DGS
 ////////////////////////////////////////////////////
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_collect_weights(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
+    const at::Tensor colors,    // [C, N, channels] or [nnz, channels]
+    const at::Tensor opacities, // [C, N]  or [nnz]
+
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+) {
+    // Set correct CUDA device for input tensors
+    DEVICE_GUARD(means2d);
+
+    // Verify tensor layout and device
+    CHECK_INPUT(means2d);
+    CHECK_INPUT(conics);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+
+    // Basic dimension checks
+    uint32_t C = tile_offsets.size(0);    // number of cameras
+    uint32_t channels = colors.size(-1);  // last dimension is color channels
+
+    // Prepare output tensors for per-Gaussian accumulations.
+    // According to the new interface, these should be the same size
+    // as 'flatten_ids' (i.e. [n_isects]) or match your "nnz" shape.
+    at::Tensor accum_weights =
+        at::zeros({flatten_ids.size(0)}, means2d.options());
+    at::Tensor accum_weights_count =
+        at::zeros({flatten_ids.size(0)}, means2d.options().dtype(at::kInt));
+    at::Tensor accum_max_count =
+        at::zeros({flatten_ids.size(0)}, means2d.options());
+
+    // Dispatch to the correct template instantiation based on 'channels'
+#define __LAUNCH_KERNEL__(N)                                                   \
+    case N:                                                                    \
+        launch_rasterize_to_pixels_3dgs_fwd_collect_weights_kernel<N>(         \
+            means2d,                                                           \
+            conics,                                                            \
+            colors,                                                            \
+            opacities,                                                         \
+            image_width,                                                       \
+            image_height,                                                      \
+            tile_size,                                                         \
+            tile_offsets,                                                      \
+            flatten_ids,                                                       \
+            accum_weights,                                                     \
+            accum_weights_count,                                               \
+            accum_max_count                                                    \
+        );                                                                     \
+        break;
+
+    switch (channels) {
+        __LAUNCH_KERNEL__(1)
+        __LAUNCH_KERNEL__(2)
+        __LAUNCH_KERNEL__(3)
+        __LAUNCH_KERNEL__(4)
+        __LAUNCH_KERNEL__(5)
+        __LAUNCH_KERNEL__(8)
+        __LAUNCH_KERNEL__(9)
+        __LAUNCH_KERNEL__(16)
+        __LAUNCH_KERNEL__(17)
+        __LAUNCH_KERNEL__(32)
+        __LAUNCH_KERNEL__(33)
+        __LAUNCH_KERNEL__(64)
+        __LAUNCH_KERNEL__(65)
+        __LAUNCH_KERNEL__(128)
+        __LAUNCH_KERNEL__(129)
+        __LAUNCH_KERNEL__(256)
+        __LAUNCH_KERNEL__(257)
+        __LAUNCH_KERNEL__(512)
+        __LAUNCH_KERNEL__(513)
+    default:
+        AT_ERROR("Unsupported number of channels: ", channels);
+    }
+#undef __LAUNCH_KERNEL__
+
+    // Return the three output tensors
+    return std::make_tuple(accum_weights, accum_weights_count, accum_max_count);
+}
 
 std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // 2D Gaussian footprints

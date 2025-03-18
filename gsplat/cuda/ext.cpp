@@ -46,6 +46,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     m.def(
+        "rasterize_to_pixels_3dgs_fwd_collect_weights", &gsplat::rasterize_to_pixels_3dgs_fwd_collect_weights
+    );
+    m.def(
         "rasterize_to_pixels_3dgs_fwd_intersection", &gsplat::rasterize_to_pixels_3dgs_fwd_intersection
     );
     m.def(

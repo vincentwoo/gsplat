@@ -11,6 +11,29 @@ namespace gsplat {
 #define FILTER_INV_SQUARE_2DGS 2.0f
 
 template <uint32_t CDIM>
+void launch_rasterize_to_pixels_3dgs_fwd_collect_weights_kernel(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
+    const at::Tensor colors,    // [C, N, channels] or [nnz, channels]
+    const at::Tensor opacities, // [C, N]  or [nnz]
+
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+
+    // New tensors to collect per-gaussian data:
+    at::Tensor accum_weights,        // same size as flatten_ids references
+    at::Tensor accum_weights_count,  // same size
+    at::Tensor accum_max_count       // same size
+);
+
+template <uint32_t CDIM>
 void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // 2D splat inputs
     const at::Tensor means2d,      // [C,N,2] or [nnz,2]
