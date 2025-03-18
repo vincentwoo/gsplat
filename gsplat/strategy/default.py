@@ -338,3 +338,17 @@ class DefaultStrategy(Strategy):
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
         return n_prune
+    @torch.no_grad()
+    def prune_gs(
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            mask: torch.Tensor,
+    ) -> int:
+
+        n_prune = mask.sum().item()
+        if n_prune > 0:
+            remove(params=params, optimizers=optimizers, state=state, mask=mask)
+
+        return n_prune

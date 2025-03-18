@@ -922,7 +922,7 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            if step % 100 == 0 and step > 1:
+            if step % 1000 == 0 and step > 1:
                 self.intersection_preserving()
                 #self.depth_reinit()
             # eval the full set
@@ -1161,6 +1161,8 @@ class Runner:
 
             return non_prune_mask
         non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99)
+        self.cfg.strategy.prune_gs(params = self.splats, optimizers = self.optimizers, state = self.strategy_state, mask = non_prune_mask==False)
+        print(f"Intersection preserving: {non_prune_mask.sum().item()}")
 
     @torch.no_grad()
     def depth_reinit(self):
