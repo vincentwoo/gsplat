@@ -16,6 +16,104 @@ namespace gsplat {
 // 3DGS
 ////////////////////////////////////////////////////
 
+std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
+    // 2D Gaussian footprints
+    const at::Tensor means2d,   // [C,N,2] or [nnz,2]
+    const at::Tensor conics,    // [C,N,3] or [nnz,3]
+    const at::Tensor colors,    // [C,N,channels] or [nnz,channels]
+    const at::Tensor opacities, // [C,N] or [nnz]
+
+    // Image / tiling
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [C, tile_h, tile_w]
+    const at::Tensor flatten_ids,  // [n_isects]
+
+    // 3D intersection data
+    const at::Tensor means3D,     // [nnz,3] or [C,N,3]
+    const at::Tensor scales,      // [nnz,3]
+    const at::Tensor rotations,   // [nnz,4]
+
+    // Camera transforms
+    const at::Tensor viewmats, // [C,4,4] row‐major extrinsics
+    const at::Tensor Ks        // [C,3,3] row‐major intrinsics
+) {
+    // ----- Optional: enforce same device, check shapes, etc. -----
+    // DEVICE_GUARD(means2d);
+    // CHECK_INPUT(means2d);
+    // CHECK_INPUT(conics);
+    // CHECK_INPUT(colors);
+    // CHECK_INPUT(opacities);
+    // CHECK_INPUT(tile_offsets);
+    // CHECK_INPUT(flatten_ids);
+    // CHECK_INPUT(means3D);
+    // CHECK_INPUT(scales);
+    // CHECK_INPUT(rotations);
+    // CHECK_INPUT(viewmats);
+    // CHECK_INPUT(Ks);
+
+    // Identify the # of cameras (C) and # of channels in 'colors'
+    uint32_t C = tile_offsets.size(0);
+    int64_t channels = colors.size(-1);
+
+    // Prepare output tensors.
+    // alphas  => [C, image_height, image_width]
+    // out_pts => [C, image_height, image_width, 3]
+    at::Tensor render_alphas = at::zeros(
+        {static_cast<int64_t>(C), static_cast<int64_t>(image_height), static_cast<int64_t>(image_width)},
+        means2d.options()
+    );
+    at::Tensor out_pts = at::zeros(
+        {static_cast<int64_t>(C), static_cast<int64_t>(image_height), static_cast<int64_t>(image_width), 3},
+        means2d.options()
+    );
+
+    // Use a switch-case to handle the # of channels at compile time.
+    // Just like your example code snippet, define a macro for brevity.
+#define __LAUNCH_INTERSECTION_KERNEL__(N)                                      \
+    case N:                                                                    \
+        launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel<N>(      \
+            means2d, conics, colors, opacities,                                \
+            image_width, image_height, tile_size,                              \
+            tile_offsets, flatten_ids,                                         \
+            means3D, scales, rotations,                                        \
+            viewmats, Ks,                                                      \
+            render_alphas, out_pts                                             \
+        );                                                                     \
+        break;
+
+    // Switch on channels
+    switch (channels) {
+        __LAUNCH_INTERSECTION_KERNEL__(1)
+        __LAUNCH_INTERSECTION_KERNEL__(2)
+        __LAUNCH_INTERSECTION_KERNEL__(3)
+        __LAUNCH_INTERSECTION_KERNEL__(4)
+        __LAUNCH_INTERSECTION_KERNEL__(5)
+        __LAUNCH_INTERSECTION_KERNEL__(8)
+        __LAUNCH_INTERSECTION_KERNEL__(9)
+        __LAUNCH_INTERSECTION_KERNEL__(16)
+        __LAUNCH_INTERSECTION_KERNEL__(17)
+        __LAUNCH_INTERSECTION_KERNEL__(32)
+        __LAUNCH_INTERSECTION_KERNEL__(33)
+        __LAUNCH_INTERSECTION_KERNEL__(64)
+        __LAUNCH_INTERSECTION_KERNEL__(65)
+        __LAUNCH_INTERSECTION_KERNEL__(128)
+        __LAUNCH_INTERSECTION_KERNEL__(129)
+        __LAUNCH_INTERSECTION_KERNEL__(256)
+        __LAUNCH_INTERSECTION_KERNEL__(257)
+        __LAUNCH_INTERSECTION_KERNEL__(512)
+        __LAUNCH_INTERSECTION_KERNEL__(513)
+    default:
+        AT_ERROR("Unsupported channel count for intersection rasterization: ", channels);
+    }
+#undef __LAUNCH_INTERSECTION_KERNEL__
+
+    // Return the final results. Adjust as needed if you want a different structure.
+    return std::make_pair(render_alphas, out_pts);
+}
+
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]

@@ -38,7 +38,7 @@ from lib_bilagrid import (
 
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
-from gsplat.rendering import rasterization
+from gsplat.rendering import rasterization, rasterization_depth_reinit
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
@@ -56,9 +56,9 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/home/paja/data/fasnacht"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -505,6 +505,55 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
+    def rasterize_depht_init_splats(
+            self,
+            camtoworlds: Tensor,
+            Ks: Tensor,
+            width: int,
+            height: int,
+            masks: Optional[Tensor] = None,
+            **kwargs,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        means = self.splats["means"]  # [N, 3]
+        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        # rasterization does normalization internally
+        quats = self.splats["quats"]  # [N, 4]
+        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+
+        image_ids = kwargs.pop("image_ids", None)
+        if self.cfg.app_opt:
+            colors = self.app_module(
+                features=self.splats["features"],
+                embed_ids=image_ids,
+                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
+                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+            )
+            colors = colors + self.splats["colors"]
+            colors = torch.sigmoid(colors)
+        else:
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+
+        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        render_alphas, points, info = rasterization_depth_reinit(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+            Ks=Ks,  # [C, 3, 3]
+            width=width,
+            height=height,
+            packed=False,
+            absgrad=False,
+            sparse_grad=False,
+            rasterize_mode=rasterize_mode,
+            distributed=self.world_size > 1,
+            camera_model=self.cfg.camera_model,
+            **kwargs,
+        )
+        return render_alphas, points, info
 
     def train(self):
         cfg = self.cfg
@@ -830,6 +879,7 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
+            #self.depth_reinit()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -1004,6 +1054,39 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+
+    @torch.no_grad()
+    def depth_reinit(self):
+        """Entry for trajectory rendering."""
+        print("Running trajectory rendering...")
+        cfg = self.cfg
+        device = self.device
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        weights = torch.zeros_like(self.splats["opacities"])
+        print("depth_reinit")
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
+
+            alphas, points, _ = self.rasterize_depht_init_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB",
+                collect_weights=True,
+                weights=weights,
+            )  # [1, H, W, 4]
+
 
     @torch.no_grad()
     def run_compression(self, step: int):

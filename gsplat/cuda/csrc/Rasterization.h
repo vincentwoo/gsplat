@@ -10,6 +10,35 @@ namespace gsplat {
 
 #define FILTER_INV_SQUARE_2DGS 2.0f
 
+template <uint32_t CDIM>
+void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
+    // 2D splat inputs
+    const at::Tensor means2d,      // [C,N,2] or [nnz,2]
+    const at::Tensor conics,       // [C,N,3] or [nnz,3]
+    const at::Tensor colors,       // [C,N,CDIM] or [nnz,CDIM]
+    const at::Tensor opacities,    // [C,N] or [nnz]
+
+    // Image / Tiling
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [C,tile_h,tile_w]
+    const at::Tensor flatten_ids,  // [n_isects]
+
+    // 3D intersection data
+    const at::Tensor means3D,      // [nnz,3] or [C,N,3]
+    const at::Tensor scales,       // [nnz,3]
+    const at::Tensor rotations,    // [nnz,4]
+
+    // Camera extrinsics + intrinsics
+    const at::Tensor viewmats,     // [C,4,4]
+    const at::Tensor Ks,           // [C,3,3]
+
+    // Outputs
+    at::Tensor render_alphas, // [C, image_h, image_w]
+    at::Tensor out_pts        // [C, image_h, image_w, 3]
+);
+
 /////////////////////////////////////////////////
 // rasterize_to_pixels_3dgs
 /////////////////////////////////////////////////
