@@ -22,20 +22,6 @@ struct vec3 {
 };
 
 /**
- * Kernel: forward intersection for 3D Gaussians.
- * Now it also writes debug info (16 floats per pixel) into `debug_out`.
- *
- * We store in debug_out for each pixel (pix_id):
- *   debug_out[pix_id*16 + 0]  = best_gaussian_id
- *   debug_out[pix_id*16 + 1]  = best_disc
- *   debug_out[pix_id*16 + 2]  = best_t
- *   debug_out[pix_id*16 + 3..5] = best_point (x,y,z)
- *   debug_out[pix_id*16 + 6]  = best_weight
- *   debug_out[pix_id*16 + 7..9]  = ray_origin (x,y,z)
- *   debug_out[pix_id*16 + 10..12]= ray_dir (x,y,z)
- *   debug_out[pix_id*16 + 13..15]= placeholders or extra usage
- */
-/**
  * A small helper: convert from NDC (-1..1) to pixel coords.
  */
 __forceinline__ __device__ float ndc2Pix(float v, int S)
@@ -44,10 +30,35 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
     return ((v + 1.0f) * S - 1.0f) * 0.5f;
 }
 
-/**
- * Kernel: forward intersection for 3D Gaussians.
- * Now it also writes debug info (16 floats per pixel) into `debug_out`.
- */
+template <typename scalar_t>
+__device__ __forceinline__
+void loadCameraRowMajor(
+    const scalar_t* M,
+    float &r00, float &r01, float &r02,
+    float &r10, float &r11, float &r12,
+    float &r20, float &r21, float &r22,
+    float &tx,  float &ty, float &tz
+) {
+    // row 0: M[0,1,2,3]
+    r00 = (float) M[0];
+    r01 = (float) M[1];
+    r02 = (float) M[2];
+    tx  = (float) M[3];
+    // row 1: M[4,5,6,7]
+    r10 = (float) M[4];
+    r11 = (float) M[5];
+    r12 = (float) M[6];
+    ty  = (float) M[7];
+    // row 2: M[8,9,10,11]
+    r20 = (float) M[8];
+    r21 = (float) M[9];
+    r22 = (float) M[10];
+    tz  = (float) M[11];
+    // row 3 would be M[12..15], typically [0,0,0,1].
+}
+
+//---------------------------------------------------------------------------//
+
 template <uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // Number of cameras (C) and number of gaussians (N) if not packed:
@@ -81,15 +92,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const scalar_t *__restrict__ rotations, // [nnz,4]
 
     // Camera extrinsics / intrinsics
-    const scalar_t *__restrict__ viewmats,  // [C,16], row-major
+    const scalar_t *__restrict__ viewmats,  // [C,16], **row-major** 4x4
     const scalar_t *__restrict__ Ks,        // [C,9],  row-major
 
     // Outputs
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width]
-    scalar_t *__restrict__ out_pts,       // [C, image_height, image_width, 3]
-
-    // Debug buffer (16 floats per pixel) allocated via cudaMalloc
-    scalar_t *__restrict__ debug_out
+    scalar_t *__restrict__ out_pts       // [C, image_height, image_width, 3]
 )
 {
     // Cooperative groups for block sync.
@@ -107,15 +115,14 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     tile_offsets   += camera_id * tile_height * tile_width;
     render_alphas  += camera_id * image_height * image_width;
     out_pts        += camera_id * (image_height * image_width * 3);
-    debug_out      += camera_id * (image_height * image_width * 16);
 
     // Convert (i, j) to an NDC coordinate, then back to pixel coords
     // so that we replicate the 'ndc2Pix' usage exactly.
     float ndc_x = (2.f*(float)j + 1.f) / (float)image_width  - 1.f;
     float ndc_y = (2.f*(float)i + 1.f) / (float)image_height - 1.f;
 
-    float px = ndc2Pix(ndc_x, image_width);
-    float py = ndc2Pix(ndc_y, image_height);
+    float px = ndc2Pix(ndc_x, (float)image_width);
+    float py = ndc2Pix(ndc_y, (float)image_height);
 
     int32_t pix_id = i * image_width + j;
 
@@ -124,7 +131,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
 
     // Range of Gaussians for this tile.
     int32_t range_start = tile_offsets[tile_id];
-    int32_t range_end = (
+    int32_t range_end   = (
         (camera_id == (int32_t)(C - 1)) &&
         (tile_id   == (int32_t)(tile_width*tile_height - 1))
     ) ? n_isects : tile_offsets[tile_id + 1];
@@ -135,9 +142,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
 
     // Dynamic shared memory: indices + (x,y,opac) + (A,B,C)
     extern __shared__ int s[];
-    int32_t *id_batch = (int32_t*) s;  // [block_sz]
-    vec3 *xy_opacity_batch = reinterpret_cast<vec3*>(&id_batch[block_sz]);
-    vec3 *conic_batch      = reinterpret_cast<vec3*>(&xy_opacity_batch[block_sz]);
+    int32_t *id_batch      = (int32_t*) s;                        // [block_sz]
+    vec3    *xy_opacity_batch = (vec3*)(&id_batch[block_sz]);     // [block_sz]
+    vec3    *conic_batch      = (vec3*)(&xy_opacity_batch[block_sz]); // [block_sz]
 
     // Initialize partial alpha
     float T = 1.f;
@@ -149,44 +156,55 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
         pix_out[cc] = 0.f;
     }
 
-    // Camera intrinsics
+    // Load camera intrinsics (row-major: each camera's K is in 9 floats)
     float fx = (float)Ks[camera_id*9 + 0];
     float fy = (float)Ks[camera_id*9 + 4];
     float cx = (float)Ks[camera_id*9 + 2];
     float cy = (float)Ks[camera_id*9 + 5];
 
-    // Extrinsic: row-major
+    // Load extrinsic (row-major 4x4)
     const scalar_t *vm = viewmats + camera_id*16;
-    float R00 = vm[0],  R01 = vm[1],  R02 = vm[2],  t0 = vm[3];
-    float R10 = vm[4],  R11 = vm[5],  R12 = vm[6],  t1 = vm[7];
-    float R20 = vm[8],  R21 = vm[9],  R22 = vm[10], t2 = vm[11];
+    float R00, R01, R02;
+    float R10, R11, R12;
+    float R20, R21, R22;
+    float Tx,  Ty,  Tz;
 
-    // Camera center in world space = -R^T * t
-    float rx = -(R00*t0 + R10*t1 + R20*t2);
-    float ry = -(R01*t0 + R11*t1 + R21*t2);
-    float rz = -(R02*t0 + R12*t1 + R22*t2);
+    // interpret 'vm' as a standard row-major transformation
+    loadCameraRowMajor(vm,
+                       R00, R01, R02,
+                       R10, R11, R12,
+                       R20, R21, R22,
+                       Tx,  Ty,  Tz);
+
+    // camera eqn: p_cam = R * p_world + T
+    // => camera center in world = -R^T * T
+    float rx = -(R00*Tx + R10*Ty + R20*Tz);
+    float ry = -(R01*Tx + R11*Ty + R21*Tz);
+    float rz = -(R02*Tx + R12*Ty + R22*Tz);
 
     float3 ray_origin = { rx, ry, rz };
 
-    // Direction in camera coords => (x_cam, y_cam, 1.f).
+    // pinhole direction in camera coords => (x_cam, y_cam, 1)
     float x_cam = (px - cx) / (fx + 1e-12f);
     float y_cam = (py - cy) / (fy + 1e-12f);
 
-    // Rotate by R^T => direction in world
+    // rotate by R^T => world direction
+    // we interpret p_cam as (x_cam, y_cam, 1),
+    // so p_world_dir = R^T * p_cam
     float dx = (R00*x_cam + R10*y_cam + R20*1.f);
     float dy = (R01*x_cam + R11*y_cam + R21*1.f);
     float dz = (R02*x_cam + R12*y_cam + R22*1.f);
 
-    // Normalize
+    // normalize
     float len_dir = sqrtf(dx*dx + dy*dy + dz*dz + 1e-12f);
-    float3 ray_dir = { dx/len_dir, dy/len_dir, dz/len_dir };
+    float3 ray_dir = { dx / len_dir, dy / len_dir, dz / len_dir };
 
     // Track best intersection info
     float weight_max = 0.f;
     float3 best_point = {0.f, 0.f, 0.f};
-    int best_id = -1;
+    int   best_id   = -1;
     float best_disc = 0.f;
-    float best_t = 0.f;
+    float best_t    = 0.f;
 
     // Iterate over tile gaussians in batches
     uint32_t tr = block.thread_rank();
@@ -203,28 +221,31 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             int32_t g = flatten_ids[idx];
             id_batch[tr] = g;
 
+            // Load 2D Gaussian center + opacity
             vec2 xy   = means2d[g];
             float opac= (float)opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
 
-            conic_batch[tr] = conics[g]; // (A,B,C)
+            // Load conic parameters (A,B,C)
+            conic_batch[tr] = conics[g];
         }
         block.sync();
 
+        // Process each item in the batch
         uint32_t batch_size = min(block_sz, (uint32_t)(range_end - batch_start));
         for (uint32_t t = 0; (t < batch_size) && !done; t++) {
-            const vec3 &co   = conic_batch[t];      // (A,B,C)
-            const vec3 &xyo  = xy_opacity_batch[t]; // (x,y,opac)
-            float opac       = xyo.z;
+            const vec3 &co  = conic_batch[t];      // (A,B,C)
+            const vec3 &xyo = xy_opacity_batch[t]; // (x,y,opac)
+            float opac      = xyo.z;
 
-            // 2D elliptical footprint
+            // 2D elliptical footprint in screen coords
             float dx_ = xyo.x - px;
             float dy_ = xyo.y - py;
-            // sigma = 0.5*(A*x^2 + C*y^2) + B*x*y
+            // sigma = 0.5*(A*dx^2 + C*dy^2) + B*(dx*dy)
             float sigma = 0.5f*(co.x*dx_*dx_ + co.z*dy_*dy_) + co.y*(dx_*dy_);
 
             // alpha = opac * exp(-sigma)
-            float alpha = fminf(0.999f, opac*__expf(-sigma));
+            float alpha = fminf(0.999f, opac * __expf(-sigma));
             if (sigma < 0.f || alpha < 1.f/255.f) {
                 continue;
             }
@@ -246,7 +267,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
                 done = true;
             }
 
+            // -------------------------
             // 3D intersection test
+            // -------------------------
             int32_t g = id_batch[t];
             float mx = (float)means3D[g*3 + 0];
             float my = (float)means3D[g*3 + 1];
@@ -277,10 +300,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float Rm21=yz2 + rx2;
             float Rm22=1.f - (xx2 + yy2);
 
+            // Translate ray_origin into the local coords of that Gaussian
             float ox = ray_origin.x - mx;
             float oy = ray_origin.y - my;
             float oz = ray_origin.z - mz;
 
+            // Then rotate by that Gaussian's orientation
             float oX = Rm00*ox + Rm01*oy + Rm02*oz;
             float oY = Rm10*ox + Rm11*oy + Rm12*oz;
             float oZ = Rm20*ox + Rm21*oy + Rm22*oz;
@@ -289,6 +314,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float dY = Rm10*ray_dir.x + Rm11*ray_dir.y + Rm12*ray_dir.z;
             float dZ = Rm20*ray_dir.x + Rm21*ray_dir.y + Rm22*ray_dir.z;
 
+            // Scale
             float invsx = 1.f/(sx*3.f);
             float invsy = 1.f/(sy*3.f);
             float invsz = 1.f/(sz*3.f);
@@ -296,15 +322,15 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
             float ooX = oX*invsx, ooY = oY*invsy, ooZ = oZ*invsz;
             float ddX = dX*invsx, ddY = dY*invsy, ddZ = dZ*invsz;
 
-            float A = ddX*ddX + ddY*ddY + ddZ*ddZ;
-            float B = 2.f*(ddX*ooX + ddY*ooY + ddZ*ooZ);
-            float C = (ooX*ooX + ooY*ooY + ooZ*ooZ) - 1.f;
+            float A_ = ddX*ddX + ddY*ddY + ddZ*ddZ;
+            float B_ = 2.f*(ddX*ooX + ddY*ooY + ddZ*ooZ);
+            float C_ = (ooX*ooX + ooY*ooY + ooZ*ooZ) - 1.f;
 
-            float disc = B*B - 4.f*A*C;
+            float disc = B_*B_ - 4.f*A_*C_;
             if (disc > 0.f) {
                 float sqrt_disc = sqrtf(disc);
-                float t1 = (-B - sqrt_disc) / (2.f * A);
-                float t2 = (-B + sqrt_disc) / (2.f * A);
+                float t1 = (-B_ - sqrt_disc) / (2.f * A_);
+                float t2 = (-B_ + sqrt_disc) / (2.f * A_);
                 // pick the smaller positive root
                 float t_ = -1.f;
                 if (t1>0.f && t2>0.f) t_ = fminf(t1, t2);
@@ -324,9 +350,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
                     }
                 }
             }
-        }
+        } // end for t
         block.sync();
-    }
+    } // end for b
 
     // Write final outputs
     if (inside) {
@@ -334,27 +360,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
         out_pts[pix_id*3 + 0] = (scalar_t)best_point.x;
         out_pts[pix_id*3 + 1] = (scalar_t)best_point.y;
         out_pts[pix_id*3 + 2] = (scalar_t)best_point.z;
-
-        // Write debug: 16 floats per pixel
-        float* dbg = debug_out + (pix_id*16);
-        dbg[0]  = (float)best_id;
-        dbg[1]  = best_disc;
-        dbg[2]  = best_t;
-        dbg[3]  = best_point.x;
-        dbg[4]  = best_point.y;
-        dbg[5]  = best_point.z;
-        dbg[6]  = weight_max;
-        dbg[7]  = ray_origin.x;
-        dbg[8]  = ray_origin.y;
-        dbg[9]  = ray_origin.z;
-        dbg[10] = ray_dir.x;
-        dbg[11] = ray_dir.y;
-        dbg[12] = ray_dir.z;
-        dbg[13] = -1.f;
-        dbg[14] = -1.f;
-        dbg[15] = -1.f;
     }
 }
+
 
 template <uint32_t CDIM>
 void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
@@ -397,14 +405,6 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     uint32_t n_isects = flatten_ids.size(0);
     uint32_t N = packed ? 0 : means2d.size(1);
 
-    // 1) Allocate debug buffer on device: shape [C, image_h, image_w, 16 floats]
-    size_t total_pixels = (size_t)C*(size_t)image_height*(size_t)image_width;
-    size_t debug_size   = total_pixels * 16 * sizeof(float);
-    float* d_debug_out  = nullptr;
-    cudaMalloc(&d_debug_out, debug_size);
-    cudaMemset(d_debug_out, 0, debug_size); // init to zero
-
-    // 2) Setup grid
     dim3 grid(C, tile_h, tile_w);
     dim3 threads(tile_size, tile_size, 1);
 
@@ -417,7 +417,6 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
       (int)shmem_sz
     );
 
-    // 3) Launch kernel
     rasterize_to_pixels_3dgs_fwd_intersection_kernel<CDIM, float>
       <<<grid, threads, shmem_sz, at::cuda::getCurrentCUDAStream()>>>(
          C, N, n_isects, packed,
@@ -443,66 +442,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
          Ks.data_ptr<float>(),
          // Outputs
          render_alphas.data_ptr<float>(),
-         out_pts.data_ptr<float>(),
-
-         // debug
-         d_debug_out
+         out_pts.data_ptr<float>()
       );
-
-    // 4) Sync + check
-    cudaDeviceSynchronize();
-
-    // 5) Copy debug data to host + print partial
-    float* h_debug_out = (float*)malloc(debug_size);
-    cudaMemcpy(h_debug_out, d_debug_out, debug_size, cudaMemcpyDeviceToHost);
-    bool debug = false;
-    if (debug) {
-
-        printf("\n=== Debug Info (partial) ===\n");
-        printf("C=%d, H=%d, W=%d, debug=16 floats per pixel\n",
-               (int)C, (int)image_height, (int)image_width);
-
-        // Print up to 2 cameras, 4×4 region
-        int max_cam = (C<2)?(int)C:2;
-        int max_i   = (image_height<4)?(int)image_height:4;
-        int max_j   = (image_width<4)?(int)image_width:4;
-
-        for (int c = 0; c < max_cam; c++) {
-          for (int i = 0; i < max_i; i++) {
-            for (int j = 0; j < max_j; j++) {
-              size_t pix_id = (size_t)c*image_height*image_width + i*image_width + j;
-              const float* dbg = &h_debug_out[pix_id*16];
-              int   best_id   = (int)dbg[0];
-              float best_disc = dbg[1];
-              float best_t    = dbg[2];
-              float bx        = dbg[3];
-              float by        = dbg[4];
-              float bz        = dbg[5];
-              float w         = dbg[6];
-              float ox        = dbg[7];
-              float oy        = dbg[8];
-              float oz        = dbg[9];
-              float dx        = dbg[10];
-              float dy        = dbg[11];
-              float dz        = dbg[12];
-
-              printf("[cam=%d, i=%d, j=%d]: bestID=%d, disc=%.3f, t=%.3f, w=%.3f\n"
-                     "   best_point=(%.3f,%.3f,%.3f)\n"
-                     "   ray_origin=(%.3f,%.3f,%.3f), ray_dir=(%.3f,%.3f,%.3f)\n",
-                     c, i, j,
-                     best_id, best_disc, best_t, w,
-                     bx, by, bz,
-                     ox, oy, oz,
-                     dx, dy, dz);
-            }
-          }
-        }
-        printf("=== End Debug Info ===\n\n");
-    }
-
-    // 6) Free memory; We let it here for now: TODO: remove this memory stuff
-    free(h_debug_out);
-    cudaFree(d_debug_out);
 }
 
 

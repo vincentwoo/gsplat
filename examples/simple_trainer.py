@@ -57,7 +57,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/fasnacht"
+    data_dir: str = "/home/paja/data/whz"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -156,7 +156,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -924,7 +924,8 @@ class Runner:
 
             if step % 1000 == 0 and step > 1:
                 self.intersection_preserving()
-                #self.depth_reinit()
+            if step % 3000 == 0 and step > 1:
+                self.depth_reinit()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
