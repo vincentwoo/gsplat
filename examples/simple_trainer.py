@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import string
 import time
@@ -7,6 +6,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
+import math
 import imageio
 import nerfview
 import numpy as np
@@ -57,7 +57,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/whz"
+    data_dir: str = "/home/paja/data/fasnacht"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -101,7 +101,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 3
+    sh_degree: int = 0
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -232,6 +232,97 @@ def write_points_with_colors_to_ply(filename, pts_xyz, pts_rgb):
             r, g, b = pts_rgb[i]
             f.write(f"{x:.5f} {y:.5f} {z:.5f} {r} {g} {b}\n")
 
+
+def reinit_splats_from_depth(points,
+                             rgbs,
+                             scene_scale: float = 3.0,
+                             init_opacity: float = 0.1,
+                             init_scale: float = 1.0,
+                             sh_degree: int = 3,
+                             feature_dim: Optional[int] = None,
+                             device: str = "cuda",
+                             batch_size: int = 1,
+                             world_rank: int = 0,
+                             world_size: int = 1,
+                             sparse_grad: bool = False,
+                             visible_adam: bool = False,
+                             ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    if points.shape[0] == 0:
+        raise ValueError("No points returned from depth_reinit, cannot create splats.")
+
+    # Simple KNN for approximate scale
+    # We'll do exactly like your snippet: find 4 neighbors, skip the self-dist.
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg)
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    # 3) Distribute points across ranks if in multi-GPU setting:
+    points = points[world_rank::world_size]
+    rgbs   = rgbs[world_rank::world_size]
+    scales = scales[world_rank::world_size]
+
+    N = points.shape[0]
+    if N < 1:
+        raise ValueError("No points remain after distribution among ranks, cannot init.")
+
+    # Quaternions ~ random
+    quats = torch.rand((N, 4), device=points.device)  # [N,4]
+
+    # Opacities in logit space
+    opacities = torch.logit(
+        torch.full((N,), init_opacity, device=points.device).clamp(1e-4, 1 - 1e-4)
+    )  # [N]
+
+    params = [
+        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+        ("scales",   torch.nn.Parameter(scales),   5e-3),
+        ("quats",    torch.nn.Parameter(quats),    1e-3),
+        ("opacities", torch.nn.Parameter(opacities),5e-2),
+    ]
+
+    if feature_dim is None:
+        # color is SH coefficients.
+        # same logic as your code snippet
+        K = (sh_degree + 1) ** 2  # number of SH bands
+        colors = torch.zeros((N, K, 3), device=points.device)  # [N,K,3]
+        # Put the raw rgb in SH band 0
+        colors[:, 0, :] = rgb_to_sh(rgbs)
+        # You might want a different init for higher bands
+        # (random small? or zeros?).
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+    else:
+        # use features for shading + separate "colors"
+        feats = torch.rand(N, feature_dim, device=points.device)
+        params.append(("features", torch.nn.Parameter(feats), 2.5e-3))
+        # logit of the rgb
+        color_logits = torch.logit(rgbs.clamp(1e-4, 1 - 1e-4))
+        params.append(("colors", torch.nn.Parameter(color_logits), 2.5e-3))
+
+    # Build the ParameterDict
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+
+    # 5) Build per-parameter optimizer
+    BS = batch_size * world_size
+    if sparse_grad:
+        opt_class = torch.optim.SparseAdam
+    elif visible_adam:
+        # Some custom class from your snippet
+        opt_class = SelectiveAdam
+    else:
+        opt_class = torch.optim.Adam
+
+    optimizers = {
+        name: opt_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS)}],
+            eps=1e-15 / math.sqrt(BS),
+            betas=(1 - BS*(1-0.9), 1 - BS*(1-0.999)),
+        )
+        for (name, v, lr) in params
+    }
+
+    print(f"Initialized {N} splats from depth-based reinit.")
+    return splats, optimizers
 
 
 def create_splats_with_optimizers(
@@ -943,11 +1034,6 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
-            if step % 1000 == 0 and step > 1:
-                self.intersection_preserving()
-            if step % 3000 == 0 and step > 1:
-                self.depth_reinit()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -967,6 +1053,38 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+            if step % 1000 == 0 and step > 1:
+                self.intersection_preserving()
+            if step == 2000:
+                points, rgbs =  self.depth_reinit()
+                feature_dim = 32 if self.cfg.app_opt else None
+                self.splats, self.optimizers = reinit_splats_from_depth(
+                    points=points,
+                    rgbs=rgbs,
+                    scene_scale=self.scene_scale,
+                    init_opacity = self.cfg.init_opa,
+                    init_scale = self.cfg.init_scale,
+                    sh_degree = self.cfg.sh_degree,
+                    sparse_grad = self.cfg.sparse_grad,
+                    visible_adam = self.cfg.visible_adam,
+                    batch_size = self.cfg.batch_size,
+                    feature_dim = feature_dim,
+                    device = self.device,
+                    world_rank = self.world_rank,
+                    world_size = self.world_size,
+                )
+                self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    self.strategy_state = self.cfg.strategy.initialize_state(
+                        scene_scale=self.scene_scale
+                    )
+                elif isinstance(self.cfg.strategy, MCMCStrategy):
+                    self.strategy_state = self.cfg.strategy.initialize_state()
+                else:
+                    assert_never(self.cfg.strategy)
+
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1124,7 +1242,6 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
-    @torch.no_grad()
     def intersection_preserving(self):
         """Entry for trajectory rendering."""
 
@@ -1190,10 +1307,6 @@ class Runner:
     @torch.no_grad()
     def depth_reinit(self):
         """Entry for trajectory rendering with color extraction and PLY output."""
-        import numpy as np
-        import torch
-        import tqdm
-
         cfg = self.cfg
         device = self.device
 
@@ -1294,22 +1407,26 @@ class Runner:
 
         # Sort to preserve the order of first occurrence
         unique_indices_sorted = np.sort(unique_indices)
-        pts_cols_unique = pts_cols[unique_indices_sorted]
 
-        # Split back into positions (xyz) and colors (rgb)
+        pts_cols_unique = pts_cols_np[unique_indices_sorted]
+
         unique_points_np = pts_cols_unique[:, :3]
         unique_colors_np = pts_cols_unique[:, 3:]  # shape [M, 3]
 
         print(f"Total points after deduplication: {unique_points_np.shape[0]}")
 
         # Write out to ASCII PLY
-        output_ply_path = "output.ply"
-        write_points_with_colors_to_ply(
-            filename=output_ply_path,
-            pts_xyz=unique_points_np,
-            pts_rgb=unique_colors_np
-        )
-        print(f"Saved PLY: {output_ply_path}")
+        # output_ply_path = "output.ply"
+        # write_points_with_colors_to_ply(
+        #    filename=output_ply_path,
+        #    pts_xyz=unique_points_np,
+        #    pts_rgb=unique_colors_np
+        # )
+        # print(f"Saved PLY: {output_ply_path}")
+        unique_points = torch.from_numpy(unique_points_np).float().to(device)
+        unique_colors = torch.from_numpy(unique_colors_np).float().to(device)
+
+        return unique_points, unique_colors
 
     @torch.no_grad()
     def run_compression(self, step: int):
