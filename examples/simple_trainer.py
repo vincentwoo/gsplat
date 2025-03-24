@@ -84,7 +84,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -1037,7 +1037,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                #self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1054,11 +1054,12 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-            if step % 1000 == 0 and step > 1:
+            if step % 2000 == 0 and 1 < step < 15_000:
                 self.intersection_preserving()
             if step == 2000:
                 points, rgbs =  self.depth_reinit()
                 feature_dim = 32 if self.cfg.app_opt else None
+                self.cfg.sh_degree = 3
                 self.splats, self.optimizers = reinit_splats_from_depth(
                     points=points,
                     rgbs=rgbs,
@@ -1485,7 +1486,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
         step = ckpts[0]["step"]
         runner.eval(step=step)
-        runner.render_traj(step=step)
+        #runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
