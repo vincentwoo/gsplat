@@ -101,12 +101,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_coll
     return std::make_tuple(accum_weights, accum_weights_count, accum_max_count);
 }
 
-std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // 2D Gaussian footprints
     const at::Tensor means2d,   // [C,N,2] or [nnz,2]
     const at::Tensor conics,    // [C,N,3] or [nnz,3]
     const at::Tensor colors,    // [C,N,channels] or [nnz,channels]
     const at::Tensor opacities, // [C,N] or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
 
     // Image / tiling
     const uint32_t image_width,
@@ -145,6 +146,8 @@ std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // Prepare output tensors.
     // alphas  => [C, image_height, image_width]
     // out_pts => [C, image_height, image_width, 3]
+    at::Tensor renders =
+        at::empty({C, image_height, image_width, channels}, means2d.options());
     at::Tensor render_alphas = at::zeros(
         {static_cast<int64_t>(C), static_cast<int64_t>(image_height), static_cast<int64_t>(image_width)},
         means2d.options()
@@ -158,13 +161,13 @@ std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // Just like your example code snippet, define a macro for brevity.
 #define __LAUNCH_INTERSECTION_KERNEL__(N)                                      \
     case N:                                                                    \
-        launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel<N>(      \
-            means2d, conics, colors, opacities,                                \
+        launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel<N>(            \
+            means2d, conics, colors, opacities, backgrounds,                   \
             image_width, image_height, tile_size,                              \
             tile_offsets, flatten_ids,                                         \
             means3D, scales, rotations,                                        \
             viewmats, Ks,                                                      \
-            render_alphas, out_pts                                             \
+            renders, render_alphas, out_pts                              \
         );                                                                     \
         break;
 
@@ -195,7 +198,7 @@ std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
 #undef __LAUNCH_INTERSECTION_KERNEL__
 
     // Return the final results. Adjust as needed if you want a different structure.
-    return std::make_pair(render_alphas, out_pts);
+    return std::make_tuple(renders, render_alphas, out_pts);
 }
 
 

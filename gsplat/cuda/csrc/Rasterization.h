@@ -40,6 +40,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const at::Tensor conics,       // [C,N,3] or [nnz,3]
     const at::Tensor colors,       // [C,N,CDIM] or [nnz,CDIM]
     const at::Tensor opacities,    // [C,N] or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
 
     // Image / Tiling
     const uint32_t image_width,
@@ -58,6 +59,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const at::Tensor Ks,           // [C,3,3]
 
     // Outputs
+    at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor render_alphas, // [C, image_h, image_w]
     at::Tensor out_pts        // [C, image_h, image_w, 3]
 );

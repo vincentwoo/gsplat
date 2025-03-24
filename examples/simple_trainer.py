@@ -192,24 +192,46 @@ class Config:
         else:
             assert_never(strategy)
 
-def write_points_to_ply(filename: str, points: torch.Tensor):
-    """
-    Write a set of 3D points (Nx3) to an ASCII PLY file.
-    """
-    # Ensure the points are on CPU and in NumPy
-    points = points.detach().cpu().numpy()
 
+def write_points_with_colors_to_ply(filename, pts_xyz, pts_rgb):
+    """
+    Writes (x,y,z) and (r,g,b) to an ASCII PLY file.
+    Expects:
+      pts_xyz:  (N,3) float  (in world coordinates)
+      pts_rgb:  (N,3) float  (assumed either in [0,1] or [0,255])
+    """
+    import numpy as np
+    import torch
+
+    # Convert to numpy if we're dealing with PyTorch Tensors
+    if isinstance(pts_xyz, torch.Tensor):
+        pts_xyz = pts_xyz.detach().cpu().numpy()
+    if isinstance(pts_rgb, torch.Tensor):
+        pts_rgb = pts_rgb.detach().cpu().numpy()
+
+    # If rgb is in [0,1], convert to 0..255
+    if pts_rgb.max() <= 1.0:
+        pts_rgb = (pts_rgb * 255.0).clip(0, 255)
+
+    pts_rgb = pts_rgb.astype(np.uint8)
+
+    n = pts_xyz.shape[0]
     with open(filename, "w") as f:
         f.write("ply\n")
         f.write("format ascii 1.0\n")
-        f.write(f"element vertex {points.shape[0]}\n")
+        f.write(f"element vertex {n}\n")
         f.write("property float x\n")
         f.write("property float y\n")
         f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
         f.write("end_header\n")
-        for i in range(points.shape[0]):
-            x, y, z = points[i]
-            f.write(f"{x} {y} {z}\n")
+        for i in range(n):
+            x, y, z = pts_xyz[i]
+            r, g, b = pts_rgb[i]
+            f.write(f"{x:.5f} {y:.5f} {z:.5f} {r} {g} {b}\n")
+
 
 
 def create_splats_with_optimizers(
@@ -556,7 +578,7 @@ class Runner:
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if depth_reinit:
-            render_alphas, points, info = rasterization_to_msv2(
+            render_colors, render_alphas, points, info = rasterization_to_msv2(
                 means=means,
                 quats=quats,
                 scales=scales,
@@ -575,7 +597,7 @@ class Runner:
                 camera_model=self.cfg.camera_model,
                 **kwargs,
             )
-            return render_alphas, points, info
+            return render_colors, render_alphas, points, info
         else:
             accum_weights, accum_weights_count, accum_max_count, info = rasterization_to_msv2(
                 means=means,
@@ -1167,23 +1189,33 @@ class Runner:
 
     @torch.no_grad()
     def depth_reinit(self):
-        """Entry for trajectory rendering."""
+        """Entry for trajectory rendering with color extraction and PLY output."""
         import numpy as np
+        import torch
+        import tqdm
+
         cfg = self.cfg
         device = self.device
 
+        # Pick the cameras. Adjust slices as needed.
         camtoworlds_all = self.parser.camtoworlds[5:-5]
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        sampling_fraction = 0.01  # for example, keep ~1% of pixels from each image
+        # Fraction of pixels to keep from each image
+        sampling_fraction = 0.01
+
         all_points = []
+        all_colors = []
+
         for i in tqdm.trange(len(camtoworlds_all), desc="depth_reinit"):
             camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
             Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
 
-            alphas, points, _ = self.rasterize_msv2(
+            # Assumes rasterize_msv2 returns (colors, alphas, points, _).
+            # shapes: colors=[1,H,W,3], alphas=[1,H,W], points=[1,H,W,3]
+            colors, alphas, points, _ = self.rasterize_msv2(
                 camtoworlds=camtoworlds,
                 Ks=Ks_cur,
                 width=width,
@@ -1195,58 +1227,88 @@ class Runner:
                 depth_reinit=True,
             )
 
-            alphas_2d = alphas[0]  # shape [H, W]
-            points_2d = points[0]  # shape [H, W, 3]
+            # Remove the leading batch dimension [1,...]
+            colors_2d = colors[0]  # shape [H,W,3]
+            alphas_2d = alphas[0]  # shape [H,W]
+            points_2d = points[0]  # shape [H,W,3]
+
+            # Flatten: [H*W, 3], [H*W]
+            colors_flat = colors_2d.view(-1, 3)
             alphas_flat = alphas_2d.view(-1)
             points_flat = points_2d.view(-1, 3)
 
-            # 2) Probability = 1 - alpha
+            # Probability = 1 - alpha
             prob = 1.0 - alphas_flat
-
-            # 3) Normalize
             prob_sum = prob.sum()
-            if prob_sum > 1e-8:
-                prob = prob / prob_sum
-            else:
+
+            # If completely opaque, skip
+            if prob_sum < 1e-8:
                 all_points.append(points_flat)
+                all_colors.append(colors_flat)
                 continue
 
-            # 4) Decide how many points to sample
+            prob /= prob_sum  # normalize
+
             N_pixels = prob.shape[0]
             num_sampled = int(N_pixels * sampling_fraction)
-            if num_sampled < 1:
-                # If fraction is too small or image too small, sample at least 1
-                num_sampled = 1
+            num_sampled = max(num_sampled, 1)
 
-            prob_np = prob.cpu().numpy()
+            prob_np = prob.detach().cpu().numpy()
             indices = np.random.choice(
                 N_pixels, size=num_sampled, replace=False, p=prob_np
             )
 
             sampled_points = points_flat[indices]
+            sampled_colors = colors_flat[indices]
 
             all_points.append(sampled_points)
+            all_colors.append(sampled_colors)
 
+        # Concatenate results from all images
         if len(all_points) > 0:
-            all_points = torch.cat(all_points, dim=0)
+            all_points = torch.cat(all_points, dim=0)  # shape [N, 3]
+            all_colors = torch.cat(all_colors, dim=0)  # shape [N, 3]
         else:
             all_points = torch.empty(0, 3, device=device)
+            all_colors = torch.empty(0, 3, device=device)
 
         print(f"Total points collected: {all_points.shape[0]}")
 
+        # Remove any NaNs or infs
         mask = torch.isfinite(all_points).all(dim=-1)
         all_points = all_points[mask]
+        all_colors = all_colors[mask]
 
-        import numpy as np
-        pts_np = all_points.detach().cpu().numpy()
-        pts_rounded = pts_np.round(decimals=5)
-        unique_pts_rounded = np.unique(pts_rounded, axis=0)
-        unique_points = torch.from_numpy(unique_pts_rounded).to(all_points.device)
-        print(f"Total points after deduplication: {unique_points.shape[0]}")
+        # Combine xyz + rgb for dedup
+        pts_cols = torch.cat([all_points, all_colors], dim=-1)  # [N, 6]
+        pts_cols_np = pts_cols.detach().cpu().numpy()
 
-        # Write PLY
+        # Round positions for dedup (keep the first color found for each unique coordinate)
+        pts_cols_rounded = pts_cols_np.copy()
+        pts_cols_rounded[:, :3] = pts_cols_rounded[:, :3].round(decimals=5)
+
+        # Unique based on (x,y,z) only
+        unique_vals, unique_indices = np.unique(
+            pts_cols_rounded[:, :3], axis=0, return_index=True
+        )
+
+        # Sort to preserve the order of first occurrence
+        unique_indices_sorted = np.sort(unique_indices)
+        pts_cols_unique = pts_cols[unique_indices_sorted]
+
+        # Split back into positions (xyz) and colors (rgb)
+        unique_points_np = pts_cols_unique[:, :3]
+        unique_colors_np = pts_cols_unique[:, 3:]  # shape [M, 3]
+
+        print(f"Total points after deduplication: {unique_points_np.shape[0]}")
+
+        # Write out to ASCII PLY
         output_ply_path = "output.ply"
-        write_points_to_ply(output_ply_path, unique_points)
+        write_points_with_colors_to_ply(
+            filename=output_ply_path,
+            pts_xyz=unique_points_np,
+            pts_rgb=unique_colors_np
+        )
         print(f"Saved PLY: {output_ply_path}")
 
     @torch.no_grad()

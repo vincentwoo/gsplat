@@ -74,6 +74,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const vec3 *__restrict__ conics,        // [C,N,3] or [nnz,3]
     const scalar_t *__restrict__ colors,    // [C,N,CDIM] or [nnz,CDIM]
     const scalar_t *__restrict__ opacities, // [C,N] or [nnz]
+    const scalar_t *__restrict__ backgrounds, // [C, CDIM]
 
     // Image / Tiling info
     const uint32_t image_width,
@@ -96,6 +97,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const scalar_t *__restrict__ Ks,        // [C,9],  row-major
 
     // Outputs
+    scalar_t *__restrict__ render_colors,  // [C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width]
     scalar_t *__restrict__ out_pts       // [C, image_height, image_width, 3]
 )
@@ -357,6 +359,15 @@ __global__ void rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     // Write final outputs
     if (inside) {
         render_alphas[pix_id] = (scalar_t)(1.f - T);
+
+        #pragma unroll
+        for (uint32_t k = 0; k < CDIM; ++k) {
+            render_colors[pix_id * CDIM + k] =
+                backgrounds == nullptr ? pix_out[k]
+                                       : (pix_out[k] + T * backgrounds[k]);
+        }
+
+        // 3D intersection
         out_pts[pix_id*3 + 0] = (scalar_t)best_point.x;
         out_pts[pix_id*3 + 1] = (scalar_t)best_point.y;
         out_pts[pix_id*3 + 2] = (scalar_t)best_point.z;
@@ -371,6 +382,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const at::Tensor conics,       // [C,N,3] or [nnz,3]
     const at::Tensor colors,       // [C,N,CDIM] or [nnz,CDIM]
     const at::Tensor opacities,    // [C,N] or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
 
     // Image / Tiling
     const uint32_t image_width,
@@ -389,6 +401,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
     const at::Tensor Ks,           // [C,3,3]
 
     // Outputs
+    at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor render_alphas, // [C, image_h, image_w]
     at::Tensor out_pts        // [C, image_h, image_w, 3]
 )
@@ -425,6 +438,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
          reinterpret_cast<const vec3*>(conics.data_ptr<float>()),
          colors.data_ptr<float>(),
          opacities.data_ptr<float>(),
+         backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+                                 : nullptr,
          // image dims
          image_width,
          image_height,
@@ -441,6 +456,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
          viewmats.data_ptr<float>(),
          Ks.data_ptr<float>(),
          // Outputs
+         renders.data_ptr<float>(),
          render_alphas.data_ptr<float>(),
          out_pts.data_ptr<float>()
       );
@@ -457,9 +473,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
       const at::Tensor conics,  \
       const at::Tensor colors,  \
       const at::Tensor opacities,  \
-      uint32_t image_width, \
-      uint32_t image_height, \
-      uint32_t tile_size, \
+      const at::optional<at::Tensor> backgrounds, \
+      const uint32_t image_width, \
+      const uint32_t image_height, \
+      const uint32_t tile_size, \
       const at::Tensor tile_offsets, \
       const at::Tensor flatten_ids, \
       const at::Tensor means3D,  \
@@ -467,6 +484,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_intersection_kernel(
       const at::Tensor rotations,   \
       const at::Tensor viewmats,  \
       const at::Tensor Ks, \
+      at::Tensor renders,                                                    \
       at::Tensor render_alphas, \
       at::Tensor out_pts\
     );

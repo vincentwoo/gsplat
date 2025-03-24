@@ -554,7 +554,8 @@ def rasterize_to_depth_reinit(
 
         viewmats: Tensor,  # [C, 4, 4]
         Ks: Tensor,  # [C, 3, 3]
-) -> Tuple[Tensor, Tensor]:
+        backgrounds: Optional[Tensor] = None,  # [C, channels]
+) -> Tuple[Tensor, Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
     Args:
@@ -631,6 +632,16 @@ def rasterize_to_depth_reinit(
             ],
             dim=-1,
         )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device
+                    ),
+                ],
+                dim=-1,
+            )
 
     tile_height, tile_width = isect_offsets.shape[1:3]
     assert (
@@ -640,11 +651,12 @@ def rasterize_to_depth_reinit(
             tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    render_alphas, points = depth_reinit(
+    render_colors, render_alphas, points = depth_reinit(
         means2d.contiguous(),
         conics.contiguous(),
         colors.contiguous(),
         opacities.contiguous(),
+        backgrounds,
         image_width,
         image_height,
         tile_size,
@@ -657,7 +669,7 @@ def rasterize_to_depth_reinit(
         Ks.contiguous(),
     )
 
-    return render_alphas, points
+    return render_colors, render_alphas, points
 
 def rasterize_to_pixels(
     means2d: Tensor,  # [C, N, 2] or [nnz, 2]
@@ -1118,6 +1130,7 @@ def depth_reinit(
         conics: Tensor,  # [C, N, 3]
         colors: Tensor,  # [C, N, D]
         opacities: Tensor,  # [C, N]
+        backgrounds: Tensor,  # [C, D], Optional
         width: int,
         height: int,
         tile_size: int,
@@ -1128,14 +1141,15 @@ def depth_reinit(
         quats,
         viewmats,
         Ks,
-) -> Tuple[Tensor, Tensor]:
-    render_alphas, points = _make_lazy_cuda_func(
+) -> Tuple[Tensor, Tensor, Tensor]:
+    render_colors, render_alphas, points = _make_lazy_cuda_func(
         "rasterize_to_pixels_3dgs_fwd_intersection"
     )(
         means2d,
         conics,
         colors,
         opacities,
+        backgrounds,
         width,
         height,
         tile_size,
@@ -1150,7 +1164,7 @@ def depth_reinit(
 
     # double to float
     render_alphas = render_alphas.float()
-    return render_alphas, points
+    return render_colors, render_alphas, points
 
 class _RasterizeToPixels(torch.autograd.Function):
     """Rasterize gaussians"""

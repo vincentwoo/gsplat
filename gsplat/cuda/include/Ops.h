@@ -231,12 +231,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_coll
 );
 
 // Rasterize 3D Gaussian to pixels
-std::pair<at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd_intersection(
     // 2D Gaussian footprints
     const at::Tensor means2d,   // [C,N,2] or [nnz,2]
     const at::Tensor conics,    // [C,N,3] or [nnz,3]
     const at::Tensor colors,    // [C,N,channels] or [nnz,channels]
     const at::Tensor opacities, // [C,N] or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
 
     // Image / tiling
     const uint32_t image_width,

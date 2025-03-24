@@ -1090,7 +1090,7 @@ def rasterization_to_msv2(
             render_colors, render_alphas = [], []
             for i in range(n_chunks):
                 colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
-                render_alphas_, points = rasterize_to_depth_reinit(
+                render_colors_, render_alphas_, points = rasterize_to_depth_reinit(
                     means2d,
                     conics,
                     colors_chunk,
@@ -1105,11 +1105,14 @@ def rasterization_to_msv2(
                     quats=quats,
                     Ks=Ks,
                     viewmats=viewmats,
+                    backgrounds=backgrounds,
                 )
+                render_colors.append(render_colors_)
                 render_alphas.append(render_alphas_)
+            render_colors = torch.cat(render_colors, dim=-1)
             render_alphas = render_alphas[0]  # discard the rest
         else:
-            render_alphas, points = rasterize_to_depth_reinit(
+            render_colors, render_alphas, points = rasterize_to_depth_reinit(
                 means2d,
                 conics,
                 colors,
@@ -1124,9 +1127,10 @@ def rasterization_to_msv2(
                 quats=quats,
                 Ks=Ks,
                 viewmats=viewmats,
+                backgrounds=backgrounds,
             )
 
-        return render_alphas, points, meta
+        return render_colors, render_alphas, points, meta
     else:
         if colors.shape[-1] > channel_chunk:
             # slice into chunks
