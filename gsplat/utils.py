@@ -3,37 +3,44 @@ import struct
 
 import torch
 import torch.nn.functional as F
+import open3d as o3d
 from torch import Tensor
 import numpy as np
 
 
 def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
-    # Convert all tensors to numpy arrays in one go
     print(f"Saving ply to {dir}")
+
+    # Convert all tensors to numpy arrays
     numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
 
+    # Extract data arrays
     means = numpy_data["means"]
     scales = numpy_data["scales"]
     quats = numpy_data["quats"]
     opacities = numpy_data["opacities"]
 
-    sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1)
-    shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1)
+    # Handle colors or spherical harmonics based on whether colors is provided
+    if colors is not None:
+        colors = colors.detach().cpu().numpy()
+    else:
+        sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
 
     # Create a mask to identify rows with NaN or Inf in any of the numpy_data arrays
     invalid_mask = (
-        np.isnan(means).any(axis=1)
-        | np.isinf(means).any(axis=1)
-        | np.isnan(scales).any(axis=1)
-        | np.isinf(scales).any(axis=1)
-        | np.isnan(quats).any(axis=1)
-        | np.isinf(quats).any(axis=1)
-        | np.isnan(opacities).any(axis=0)
-        | np.isinf(opacities).any(axis=0)
-        | np.isnan(sh0).any(axis=1)
-        | np.isinf(sh0).any(axis=1)
-        | np.isnan(shN).any(axis=1)
-        | np.isinf(shN).any(axis=1)
+            np.isnan(means).any(axis=1)
+            | np.isinf(means).any(axis=1)
+            | np.isnan(scales).any(axis=1)
+            | np.isinf(scales).any(axis=1)
+            | np.isnan(quats).any(axis=1)
+            | np.isinf(quats).any(axis=1)
+            | np.isnan(opacities).any(axis=0)
+            | np.isinf(opacities).any(axis=0)
+            | np.isnan(sh0).any(axis=1)
+            | np.isinf(sh0).any(axis=1)
+            | np.isnan(shN).any(axis=1)
+            | np.isinf(shN).any(axis=1)
     )
 
     # Filter out rows with NaNs or Infs from all data arrays
@@ -41,61 +48,56 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     scales = scales[~invalid_mask]
     quats = quats[~invalid_mask]
     opacities = opacities[~invalid_mask]
-    sh0 = sh0[~invalid_mask]
-    shN = shN[~invalid_mask]
 
-    num_points = means.shape[0]
+    # Initialize ply_data with positions and normals
+    ply_data = {
+        "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
+        "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
+    }
 
-    with open(dir, "wb") as f:
-        # Write PLY header
-        f.write(b"ply\n")
-        f.write(b"format binary_little_endian 1.0\n")
-        f.write(f"element vertex {num_points}\n".encode())
-        f.write(b"property float x\n")
-        f.write(b"property float y\n")
-        f.write(b"property float z\n")
-        f.write(b"property float nx\n")
-        f.write(b"property float ny\n")
-        f.write(b"property float nz\n")
+    # Add features
+    if colors is not None:
+        colors = colors[~invalid_mask]
+        # Use provided colors, converted to SH coefficients
+        for j in range(colors.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                (colors[:, j: j + 1] - 0.5) / 0.2820947917738781,
+                dtype=o3d.core.Dtype.Float32,
+                )
+    else:
+        sh0 = sh0[~invalid_mask]
+        shN = shN[~invalid_mask]
+        # Use spherical harmonics (sh0 for DC, shN for rest)
+        for j in range(sh0.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                sh0[:, j: j + 1], dtype=o3d.core.Dtype.Float32
+            )
+        for j in range(shN.shape[1]):
+            ply_data[f"f_rest_{j}"] = o3d.core.Tensor(
+                shN[:, j: j + 1], dtype=o3d.core.Dtype.Float32
+            )
 
-        if colors is not None:
-            for j in range(colors.shape[1]):
-                f.write(f"property float f_dc_{j}\n".encode())
-        else:
-            for i, data in enumerate([sh0, shN]):
-                prefix = "f_dc" if i == 0 else "f_rest"
-                for j in range(data.shape[1]):
-                    f.write(f"property float {prefix}_{j}\n".encode())
+    # Add opacity
+    ply_data["opacity"] = o3d.core.Tensor(
+        opacities.reshape(-1, 1), dtype=o3d.core.Dtype.Float32
+    )
 
-        f.write(b"property float opacity\n")
+    # Add scales
+    for i in range(scales.shape[1]):
+        ply_data[f"scale_{i}"] = o3d.core.Tensor(
+            scales[:, i: i + 1], dtype=o3d.core.Dtype.Float32
+        )
 
-        for i in range(scales.shape[1]):
-            f.write(f"property float scale_{i}\n".encode())
-        for i in range(quats.shape[1]):
-            f.write(f"property float rot_{i}\n".encode())
+    # Add rotations
+    for i in range(quats.shape[1]):
+        ply_data[f"rot_{i}"] = o3d.core.Tensor(
+            quats[:, i: i + 1], dtype=o3d.core.Dtype.Float32
+        )
 
-        f.write(b"end_header\n")
-
-        # Write vertex data
-        for i in range(num_points):
-            f.write(struct.pack("<fff", *means[i]))  # x, y, z
-            f.write(struct.pack("<fff", 0, 0, 0))  # nx, ny, nz (zeros)
-
-            if colors is not None:
-                color = colors.detach().cpu().numpy()
-                for j in range(color.shape[1]):
-                    f_dc = (color[i, j] - 0.5) / 0.2820947917738781
-                    f.write(struct.pack("<f", f_dc))
-            else:
-                for data in [sh0, shN]:
-                    for j in range(data.shape[1]):
-                        f.write(struct.pack("<f", data[i, j]))
-
-            f.write(struct.pack("<f", opacities[i]))  # opacity
-
-            for data in [scales, quats]:
-                for j in range(data.shape[1]):
-                    f.write(struct.pack("<f", data[i, j]))
+    # Create and save the point cloud
+    pcd = o3d.t.geometry.PointCloud(ply_data)
+    success = o3d.t.io.write_point_cloud(dir, pcd)
+    assert success, "Ply file saving failed."
 
 
 def normalized_quat_to_rotmat(quat: Tensor) -> Tensor:
