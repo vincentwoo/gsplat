@@ -59,7 +59,7 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "/media/paja/T7/vincent/car"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -80,6 +80,7 @@ class Config:
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
+    warmup_iterations = 3_000
 
     # Number of training steps
     max_steps: int = 30_000
@@ -451,6 +452,7 @@ class Runner:
         self.trainset = Dataset(
             self.parser,
             split="train",
+            warmup_iterations=cfg.warmup_iterations,
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
@@ -775,6 +777,7 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            self.trainset.update_step(step)
             try:
                 data = next(trainloader_iter)
             except StopIteration:
