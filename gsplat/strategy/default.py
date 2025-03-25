@@ -310,6 +310,17 @@ class DefaultStrategy(Strategy):
         return n_dupli, n_split
 
     @torch.no_grad()
+    def grow_clone(
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            mask: torch.Tensor):
+
+        if mask.sum().item()  > 0:
+            duplicate(params=params, optimizers=optimizers, state=state, mask=mask)
+
+    @torch.no_grad()
     def _prune_gs(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],

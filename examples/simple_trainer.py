@@ -600,6 +600,7 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        culling = torch.zeros_like(opacities, dtype=torch.bool)  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -620,6 +621,7 @@ class Runner:
             quats=quats,
             scales=scales,
             opacities=opacities,
+            culling=culling,
             colors=colors,
             viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
             Ks=Ks,  # [C, 3, 3]
@@ -655,6 +657,7 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        culling = torch.zeros_like(opacities, dtype=torch.bool)  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -676,6 +679,7 @@ class Runner:
                 quats=quats,
                 scales=scales,
                 opacities=opacities,
+                culling=culling,
                 colors=colors,
                 viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
                 Ks=Ks,  # [C, 3, 3]
@@ -697,6 +701,7 @@ class Runner:
                 quats=quats,
                 scales=scales,
                 opacities=opacities,
+                culling=culling,
                 colors=colors,
                 viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
                 Ks=Ks,  # [C, 3, 3]
@@ -1026,6 +1031,8 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                if step >= 500 and step % 250 == 0:
+                    self.aggressive_clone()
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1307,6 +1314,67 @@ class Runner:
         non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99)
         self.cfg.strategy.prune_gs(params = self.splats, optimizers = self.optimizers, state = self.strategy_state, mask = non_prune_mask==False)
         print(f"Intersection preserving: {non_prune_mask.sum().item()}")
+
+    @torch.no_grad()
+    def aggressive_clone(self):
+        """Entry for trajectory rendering."""
+
+        device = self.device
+
+        imp_score = torch.zeros(self.splats["means"].shape[0], device=device)
+        accum_area_max = torch.zeros(self.splats["means"].shape[0], device=device)
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        for i in tqdm.trange(len(camtoworlds_all), desc="intersection_preserving"):
+            camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
+            Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
+
+            accum_weights, accum_weights_count, accum_max_count,_ = self.rasterize_msv2(
+                camtoworlds=camtoworlds,
+                Ks=Ks_cur,
+                width=width,
+                height=height,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
+                render_mode="RGB",
+                depth_reinit=False,
+            )
+
+            area_proj = accum_weights_count
+            area_max = accum_max_count
+
+            accum_area_max += area_max
+            imp_score += accum_weights
+
+        # Zero out any points that never contributed
+        def init_cdf_mask(importance, thres=1.0):
+            importance = importance.flatten()
+            if thres != 1.0:
+                percent_sum = thres
+                vals, idx = torch.sort(importance + (1e-6))
+                cumsum_val = torch.cumsum(vals, dim=0)
+                split_index = ((cumsum_val / vals.sum()) > (1 - percent_sum)).nonzero().min()
+                split_val_nonprune = vals[split_index]
+
+                non_prune_mask = importance > split_val_nonprune
+            else:
+                non_prune_mask = torch.ones_like(importance).bool()
+
+            return non_prune_mask
+        non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.999)
+        self.cfg.strategy.prune_gs(params = self.splats, optimizers = self.optimizers, state = self.strategy_state, mask = non_prune_mask==False)
+        imp_score[accum_area_max==0]=0
+        intersection_pts_mask = init_cdf_mask(importance=imp_score, thres=0.99)
+        intersection_pts_mask=intersection_pts_mask[non_prune_mask]
+        self.cfg.strategy.grow_clone(params=self.splats,
+                                     optimizers=self.optimizers,
+                                     state=self.strategy_state,
+                                     mask=intersection_pts_mask)
 
     @torch.no_grad()
     def depth_reinit(self):

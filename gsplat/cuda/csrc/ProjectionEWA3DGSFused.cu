@@ -20,6 +20,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     const scalar_t *__restrict__ covars,   // [N, 6] optional
     const scalar_t *__restrict__ quats,    // [N, 4] optional
     const scalar_t *__restrict__ scales,   // [N, 3] optional
+    const bool *__restrict__ culling,   // [N, 1] optional
     const scalar_t *__restrict__ viewmats, // [C, 4, 4]
     const scalar_t *__restrict__ Ks,       // [C, 3, 3]
     const int32_t image_width,
@@ -43,6 +44,9 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     }
     const uint32_t cid = idx / N; // camera id
     const uint32_t gid = idx % N; // gaussian id
+    if (culling[gid]) {
+        radii[idx] = 0;
+    }
 
     // shift pointers to the current camera and gaussian
     means += gid * 3;
@@ -194,6 +198,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     const at::optional<at::Tensor> covars, // [N, 6] optional
     const at::optional<at::Tensor> quats,  // [N, 4] optional
     const at::optional<at::Tensor> scales, // [N, 3] optional
+    const at::optional<at::Tensor> culling, // [N, 3] optional
     const at::Tensor viewmats,             // [C, 4, 4]
     const at::Tensor Ks,                   // [C, 3, 3]
     const uint32_t image_width,
@@ -240,6 +245,8 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
                     quats.has_value() ? quats.value().data_ptr<scalar_t>()
                                       : nullptr,
                     scales.has_value() ? scales.value().data_ptr<scalar_t>()
+                                       : nullptr,
+                    culling.has_value() ? culling.value().data_ptr<bool>()
                                        : nullptr,
                     viewmats.data_ptr<scalar_t>(),
                     Ks.data_ptr<scalar_t>(),

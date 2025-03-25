@@ -32,6 +32,7 @@ def rasterization(
     quats: Tensor,  # [N, 4]
     scales: Tensor,  # [N, 3]
     opacities: Tensor,  # [N]
+    culling: Tensor,
     colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
@@ -239,6 +240,7 @@ def rasterization(
         tri_indices = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
         covars = covars[..., tri_indices[0], tri_indices[1]]
     assert opacities.shape == (N,), opacities.shape
+    assert culling.shape == (N,), culling.shape
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
@@ -301,6 +303,7 @@ def rasterization(
         covars,
         quats,
         scales,
+        culling,
         viewmats,
         Ks,
         width,
@@ -588,6 +591,7 @@ def rasterization_to_msv2(
         quats: Tensor,  # [N, 4]
         scales: Tensor,  # [N, 3]
         opacities: Tensor,  # [N]
+        culling: Tensor,
         colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
         viewmats: Tensor,  # [C, 4, 4]
         Ks: Tensor,  # [C, 3, 3]
@@ -858,6 +862,7 @@ def rasterization_to_msv2(
         covars,
         quats,
         scales,
+        culling,
         viewmats,
         Ks,
         width,

@@ -211,6 +211,7 @@ def fully_fused_projection(
     covars: Optional[Tensor],  # [N, 6] or None
     quats: Optional[Tensor],  # [N, 4] or None
     scales: Optional[Tensor],  # [N, 3] or None
+    culling: Optional[Tensor],  # [N, 3] or None
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
     width: int,
@@ -301,6 +302,7 @@ def fully_fused_projection(
         assert scales is not None, "covars or scales is required"
         assert quats.size() == (N, 4), quats.size()
         assert scales.size() == (N, 3), scales.size()
+        culling = culling.contiguous()
         quats = quats.contiguous()
         scales = scales.contiguous()
     if sparse_grad:
@@ -314,6 +316,7 @@ def fully_fused_projection(
             covars,
             quats,
             scales,
+            culling,
             viewmats,
             Ks,
             width,
@@ -332,6 +335,7 @@ def fully_fused_projection(
             covars,
             quats,
             scales,
+            culling,
             viewmats,
             Ks,
             width,
@@ -982,6 +986,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         covars: Tensor,  # [N, 6] or None
         quats: Tensor,  # [N, 4] or None
         scales: Tensor,  # [N, 3] or None
+        culling: Tensor,  # [N, 3] or None
         viewmats: Tensor,  # [C, 4, 4]
         Ks: Tensor,  # [C, 3, 3]
         width: int,
@@ -1005,6 +1010,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             covars,
             quats,
             scales,
+            culling,
             viewmats,
             Ks,
             width,
