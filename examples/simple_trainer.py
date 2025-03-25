@@ -1100,6 +1100,10 @@ class Runner:
                     self.strategy_state = self.cfg.strategy.initialize_state()
                 else:
                     assert_never(self.cfg.strategy)
+                self.strategy_state["culling"] = torch.zeros((self.splats["means"].shape[0],
+                                                              len(self.trainset)),
+                                                             dtype=torch.bool,
+                                                             device=device)  # [N,]
 
 
     @torch.no_grad()
@@ -1336,6 +1340,25 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
+        # Zero out any points that never contributed
+        def init_cdf_mask(importance, thres=1.0):
+            importance = importance.flatten()
+            if thres != 1.0:
+                percent_sum = thres
+                vals, idx = torch.sort(importance + (1e-6))
+                cumsum_val = torch.cumsum(vals, dim=0)
+                split_index = ((cumsum_val / vals.sum()) > (1 - percent_sum)).nonzero().min()
+                split_val_nonprune = vals[split_index]
+
+                non_prune_mask = importance > split_val_nonprune
+            else:
+                non_prune_mask = torch.ones_like(importance).bool()
+
+            return non_prune_mask
+
+        count_rad = torch.zeros((self.splats["means"].shape[0],1)).cuda()
+        count_vis = torch.zeros((self.splats["means"].shape[0],1)).cuda()
+
         for i in tqdm.trange(len(camtoworlds_all), desc="intersection_preserving"):
             camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
             Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
@@ -1356,29 +1379,23 @@ class Runner:
             area_proj = accum_weights_count
             area_max = accum_max_count
 
+            visibility_mask = init_cdf_mask(importance=area_proj, thres=0.99)
+            self.strategy_state["culling"][:,i]=(visibility_mask==False)
+
             accum_area_max += area_max
             imp_score += accum_weights
+            count_vis[visibility_mask] +=1
 
-        # Zero out any points that never contributed
-        def init_cdf_mask(importance, thres=1.0):
-            importance = importance.flatten()
-            if thres != 1.0:
-                percent_sum = thres
-                vals, idx = torch.sort(importance + (1e-6))
-                cumsum_val = torch.cumsum(vals, dim=0)
-                split_index = ((cumsum_val / vals.sum()) > (1 - percent_sum)).nonzero().min()
-                split_val_nonprune = vals[split_index]
-
-                non_prune_mask = importance > split_val_nonprune
-            else:
-                non_prune_mask = torch.ones_like(importance).bool()
-
-            return non_prune_mask
         non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.999)
-        self.cfg.strategy.prune_gs(params = self.splats, optimizers = self.optimizers, state = self.strategy_state, mask = non_prune_mask==False)
+        prune_mask = (count_vis <= 1)[:, 0]
+        prune_mask = torch.logical_or(prune_mask, non_prune_mask == False)
+        self.cfg.strategy.prune_gs(params=self.splats,
+                                   optimizers=self.optimizers,
+                                   state=self.strategy_state,
+                                   mask=prune_mask)
         imp_score[accum_area_max==0]=0
         intersection_pts_mask = init_cdf_mask(importance=imp_score, thres=0.99)
-        intersection_pts_mask=intersection_pts_mask[non_prune_mask]
+        intersection_pts_mask=intersection_pts_mask[~prune_mask]
         self.cfg.strategy.grow_clone(params=self.splats,
                                      optimizers=self.optimizers,
                                      state=self.strategy_state,
@@ -1413,6 +1430,7 @@ class Runner:
                 Ks=Ks_cur,
                 width=width,
                 height=height,
+                culling=self.strategy_state["culling"][:, i],
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
@@ -1539,6 +1557,7 @@ class Runner:
         render_colors, _, _ = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
+            culling=torch.zeros_like(self.splats["opacities"], dtype=torch.bool),
             width=W,
             height=H,
             sh_degree=self.cfg.sh_degree,  # active all SH degrees
