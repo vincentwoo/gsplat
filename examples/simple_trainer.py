@@ -57,7 +57,8 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/fasnacht"
+    #data_dir: str = "/home/paja/data/fasnacht"
+    data_dir: str = "/media/paja/T7/vincent/car"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -588,6 +589,7 @@ class Runner:
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
+        culling: Tensor,
         Ks: Tensor,
         width: int,
         height: int,
@@ -600,7 +602,6 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-        culling = torch.zeros_like(opacities, dtype=torch.bool)  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -621,7 +622,7 @@ class Runner:
             quats=quats,
             scales=scales,
             opacities=opacities,
-            culling=culling,
+            culling=self.strategy_state["culling"][:,0],
             colors=colors,
             viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
             Ks=Ks,  # [C, 3, 3]
@@ -644,6 +645,7 @@ class Runner:
         return render_colors, render_alphas, info
     def rasterize_msv2(
             self,
+            culling: Tensor,
             camtoworlds: Tensor,
             Ks: Tensor,
             width: int,
@@ -657,7 +659,6 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-        culling = torch.zeros_like(opacities, dtype=torch.bool)  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -771,7 +772,10 @@ class Runner:
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
-
+        self.strategy_state["culling"] = torch.zeros((self.splats["means"].shape[0],
+                                                      len(self.trainset)),
+                                                      dtype=torch.bool,
+                                                      device=device)  # [N,]
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -818,6 +822,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
+                culling=self.strategy_state["culling"][:,image_ids],
                 sh_degree=sh_degree_to_use,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
@@ -1031,7 +1036,7 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
-                if step >= 500 and step % 250 == 0:
+                if step >= 500 and step % 250 == 0 and step != 2_000:
                     self.aggressive_clone()
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -1124,6 +1129,7 @@ class Runner:
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
+                culling=torch.zeros_like(self.splats["opacities"], dtype=torch.bool),
                 height=height,
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
@@ -1272,6 +1278,7 @@ class Runner:
 
             accum_weights, accum_weights_count, accum_max_count,_ = self.rasterize_msv2(
                 camtoworlds=camtoworlds,
+                culling=self.strategy_state["culling"][:, i],
                 Ks=Ks_cur,
                 width=width,
                 height=height,
@@ -1336,6 +1343,7 @@ class Runner:
             accum_weights, accum_weights_count, accum_max_count,_ = self.rasterize_msv2(
                 camtoworlds=camtoworlds,
                 Ks=Ks_cur,
+                culling=self.strategy_state["culling"][:, i],
                 width=width,
                 height=height,
                 sh_degree=self.cfg.sh_degree,
