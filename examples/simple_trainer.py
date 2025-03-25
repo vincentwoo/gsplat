@@ -58,7 +58,9 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     #data_dir: str = "/home/paja/data/fasnacht"
-    data_dir: str = "/media/paja/T7/vincent/car"
+    data_dir: str = "/home/paja/data/bike_aliked"
+    #data_dir: str = "/media/paja/T7/vincent/car"
+    #data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -901,6 +903,8 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            num_gs = len(self.splats["means"])
+            desc += f"GS={num_gs}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1036,7 +1040,7 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
-                if step >= 500 and step % 250 == 0 and step != 2_000:
+                if 500 <= step <= 3000 and step % 250 == 0 and step != 2_000:
                     self.aggressive_clone()
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -1069,9 +1073,11 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-            if step % 2000 == 0 and 1 < step < 15_000:
+
+            if step == 3000 or step == 8000:
                 self.intersection_preserving()
             if step == 2000:
+                self.intersection_preserving()
                 points, rgbs =  self.depth_reinit()
                 feature_dim = 32 if self.cfg.app_opt else None
                 self.cfg.sh_degree = 3
@@ -1359,7 +1365,7 @@ class Runner:
         count_rad = torch.zeros((self.splats["means"].shape[0],1)).cuda()
         count_vis = torch.zeros((self.splats["means"].shape[0],1)).cuda()
 
-        for i in tqdm.trange(len(camtoworlds_all), desc="intersection_preserving"):
+        for i in tqdm.trange(len(camtoworlds_all), desc="agressive clone"):
             camtoworlds = camtoworlds_all[i: i + 1]  # shape [1, 4, 4]
             Ks_cur = K[None]  # shape [1, 3, 3] or [1, 4, 4]
 
@@ -1414,7 +1420,7 @@ class Runner:
         width, height = list(self.parser.imsize_dict.values())[0]
 
         # Fraction of pixels to keep from each image
-        sampling_fraction = 0.01
+        sampling_fraction = 0.001
 
         all_points = []
         all_colors = []
