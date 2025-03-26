@@ -46,11 +46,11 @@ class MCMCStrategy(Strategy):
 
     """
 
-    cap_max: int = 1_000_000
+    cap_max: int = 2_500_000
     noise_lr: float = 5e5
     refine_start_iter: int = 500
-    refine_stop_iter: int = 25_000
-    refine_every: int = 100
+    refine_stop_iter: int = 43_000
+    refine_every: int = 200
     min_opacity: float = 0.005
     verbose: bool = False
 
@@ -86,7 +86,7 @@ class MCMCStrategy(Strategy):
 
         super().check_sanity(params, optimizers)
         # The following keys are required for this strategy.
-        for key in ["means", "scales", "quats", "opacities"]:
+        for key in ["means", "scales", "quats", "opacities", "w"]:
             assert key in params, f"{key} is required in params but missing."
 
     # def step_pre_backward(

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
 import nerfview
+from gsplat.utils import xyz_to_polar
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -51,19 +52,20 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/home/paja/data/giraff"
+
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 10000
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -76,9 +78,9 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 50_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 25_000, 35_000, 45_000, 50_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -150,7 +152,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -213,12 +215,15 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
+    _, w, r = xyz_to_polar(points)
+    points *=  w.unsqueeze(1)
+    w = torch.log(w)
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    dist2_avg = (knn(torch.from_numpy(parser.points).float(), 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    scales = torch.log(torch.sqrt(dist2_avg) * init_scale / r).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
+    w = w[world_rank::world_size]
     points = points[world_rank::world_size]
     rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
@@ -230,6 +235,7 @@ def create_splats_with_optimizers(
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+        ("w", torch.nn.Parameter(w), 0.0002 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
@@ -454,11 +460,10 @@ class Runner:
         masks: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
+        w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
+        means = self.splats["means"] * w_inv  # [N, 3]
         quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        scales = torch.exp(self.splats["scales"]) * w_inv * torch.norm(self.splats["means"], dim=1).unsqueeze(1)
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
@@ -519,6 +524,9 @@ class Runner:
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["w"], gamma=0.005 ** (1.0 / max_steps)
             ),
         ]
         if cfg.pose_opt:
@@ -826,7 +834,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                #self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1055,7 +1063,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
         step = ckpts[0]["step"]
         runner.eval(step=step)
-        runner.render_traj(step=step)
+        # runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:

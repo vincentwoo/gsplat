@@ -4,10 +4,12 @@ from typing import Callable, Dict, List, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed.rpc import new_method
+from torch.onnx.symbolic_opset9 import prim_constant_split
 
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
-from gsplat.utils import normalized_quat_to_rotmat
+from gsplat.utils import normalized_quat_to_rotmat, xyz_to_polar
 
 
 @torch.no_grad()
@@ -128,38 +130,53 @@ def split(
     mask: Tensor,
     revised_opacity: bool = False,
 ):
-    """Inplace split the Gaussian with the given mask.
+    """Inplace split the Gaussians with the given mask.
 
     Args:
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
-        mask: A boolean mask to split the Gaussians.
-        revised_opacity: Whether to use revised opacity formulation
-          from arXiv:2404.06109. Default: False.
+        state: A dictionary of extra running states (Tensors).
+        mask: A boolean mask (True => the Gaussians to be split).
+        revised_opacity: Whether to use the revised opacity formulation
+            from arXiv:2404.06109. Default: False.
     """
     device = mask.device
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
 
-    scales = torch.exp(params["scales"][sel])
+    w_inv = 1 / torch.exp(params["w"][sel]).unsqueeze(1)
+
+    means = params["means"][sel]
+    scales = (
+        torch.exp(params["scales"][sel])
+        * w_inv
+        * torch.norm(means, dim=1).unsqueeze(1)
+    )
     quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    rotmats = normalized_quat_to_rotmat(quats)
+
     samples = torch.einsum(
         "nij,nj,bnj->bni",
         rotmats,
         scales,
         torch.randn(2, len(scales), 3, device=device),
-    )  # [2, N, 3]
+    )
+
+    new_means = (means * w_inv + samples).reshape(-1, 3)
+    _, new_w, _ = xyz_to_polar(new_means)
+    new_means = new_means * new_w.unsqueeze(1)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         repeats = [2] + [1] * (p.dim() - 1)
         if name == "means":
-            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+            p_split = new_means
         elif name == "scales":
-            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            p_split = torch.log(torch.exp(params["scales"][sel]) / 1.6).repeat(2, 1)
         elif name == "opacities" and revised_opacity:
             new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
-            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+            p_split = torch.logit(new_opacities).repeat(repeats)
+        elif name == "w":
+            p_split = torch.log(new_w)
         else:
             p_split = p[sel].repeat(repeats)
         p_new = torch.cat([p[rest], p_split])
@@ -257,18 +274,20 @@ def relocate(
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         mask: A boolean mask to indicates which Gaussians are dead.
     """
-    # support "opacities" with shape [N,] or [N, 1]
-    opacities = torch.sigmoid(params["opacities"])
-
+    opacities = torch.sigmoid(params["opacities"]).flatten()  # shape [N,]
     dead_indices = mask.nonzero(as_tuple=True)[0]
     alive_indices = (~mask).nonzero(as_tuple=True)[0]
     n = len(dead_indices)
+    if n == 0:
+        return  # nothing to do
 
-    # Sample for new GSs
+    # sample from alive
     eps = torch.finfo(torch.float32).eps
-    probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
+    probs = opacities[alive_indices]
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     sampled_idxs = alive_indices[sampled_idxs]
+
+    # new opacities/scales
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
         scales=torch.exp(params["scales"])[sampled_idxs],
@@ -278,23 +297,37 @@ def relocate(
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
+        # for the chosen "alive" indices => update them
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
+        else:
+            # e.g. means, w, quats => no "random offset" in relocate;
+            # we simply keep them as is or we might do something more advanced.
+            # By default, let's keep the sampling approach consistent:
+            #   dead => replaced by the chosen sample
+            #   alive => unchanged except the ones in sampled_idxs might
+            #            forcibly have their optimizer state reset below.
+            pass
+
+        # for the truly "dead" => set them to the newly updated indices
+        # (the same location/orientation as the sampled one).
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        # reset states for the ones we just relocated
         v[sampled_idxs] = 0
         return v
 
-    # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
-    # update the extra running state
+    # also reset any extra state
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
+            # similarly set "dead" from "sampled_idxs"
             v[sampled_idxs] = 0
+            v[dead_indices] = v[sampled_idxs]
 
 
 @torch.no_grad()
@@ -311,6 +344,7 @@ def sample_add(
     eps = torch.finfo(torch.float32).eps
     probs = opacities.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
         scales=torch.exp(params["scales"])[sampled_idxs],
@@ -320,24 +354,28 @@ def sample_add(
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
+        # shape: oldN = p.shape[0]
+        # we will append new entries = p[sampled_idxs], possibly with modifications
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
-        p_new = torch.cat([p, p[sampled_idxs]])
+        # For means, w, quats, etc., we simply copy from the chosen source.
+        # If you prefer a random offset (like in 'split'), you can do so here.
+        p_new = torch.cat([p, p[sampled_idxs]], dim=0)
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        # The newly added items have fresh (zeroed) states
         v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
-        return torch.cat([v, v_new])
+        return torch.cat([v, v_new], dim=0)
 
-    # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
-    # update the extra running state
+    # expand any state vectors similarly
     for k, v in state.items():
-        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v_new))
+            v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+            state[k] = torch.cat((v, v_new), dim=0)
 
 
 @torch.no_grad()
@@ -347,23 +385,63 @@ def inject_noise_to_position(
     state: Dict[str, Tensor],
     scaler: float,
 ):
-    opacities = torch.sigmoid(params["opacities"].flatten())
-    scales = torch.exp(params["scales"])
-    covars, _ = quat_scale_to_covar_preci(
-        params["quats"],
-        scales,
-        compute_covar=True,
-        compute_preci=False,
-        triu=False,
-    )
+    """Inject noise into the positions, respecting the 'homogeneous' representation.
 
+    We have:
+      means = (x*r, y*r, z*r),
+      w = log(r).
+
+    Procedure:
+      1) Convert means to Cartesian => cart = means / exp(w).
+      2) Compute a noise offset in that local tangent space. We can still
+         scale noise by the covariance from quat & scale, but that is up to you.
+      3) cart_new = cart + noise
+      4) Convert cart_new => new radius => means/w.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers (not updated here, but we keep the signature).
+        state: A dictionary of extra states (not used here, but we keep the signature).
+        scaler: scalar factor for noise amplitude.
+    """
+
+    # Slightly sharpened control for how quickly noise goes to 0 as opacity -> 1
     def op_sigmoid(x, k=100, x0=0.995):
-        return 1 / (1 + torch.exp(-k * (x - x0)))
+        return 1.0 / (1.0 + torch.exp(-k * (x - x0)))
 
-    noise = (
-        torch.randn_like(params["means"])
-        * (op_sigmoid(1 - opacities)).unsqueeze(-1)
-        * scaler
+    # Grab the existing data
+    means = params["means"]       # shape [N, 3]
+    w_log = params["w"]          # shape [N]
+    opacities = torch.sigmoid(params["opacities"].flatten())  # shape [N]
+    scales = torch.exp(params["scales"])                      # shape [N]
+
+    # Convert to Cartesian
+    cart = means / torch.exp(w_log).unsqueeze(-1)  # shape [N, 3]
+
+    # Covariance-based noise scale
+    # The function returns (covars, None), where covars is [N,3,3] if triu=False.
+    covars, _ = quat_scale_to_covar_preci(
+        params["quats"], scales, compute_covar=True, compute_preci=False, triu=False
     )
-    noise = torch.einsum("bij,bj->bi", covars, noise)
-    params["means"].add_(noise)
+
+    # The factor (op_sigmoid(1 - opacities)) is near 1 for low opacities and near 0 for high.
+    noise_factor = op_sigmoid(1.0 - opacities).unsqueeze(-1)  # shape [N,1]
+    raw_noise = torch.randn_like(means)  # shape [N,3]
+
+    # transform noise by the covariance
+    # noise_out = covars @ raw_noise, i.e. shape [N,3]
+    noise = torch.einsum("nij,nj->ni", covars, raw_noise) * noise_factor * scaler
+
+    # Add to Cartesian
+    cart_new = cart + noise
+
+    # Convert back to homogeneous
+    #   r_new = radius of cart_new
+    #   means_new = cart_new * r_new
+    #   w_new = log(r_new)
+    _, r_new, _ = xyz_to_polar(cart_new)
+    means_new = cart_new * r_new.unsqueeze(1)
+
+    # Store
+    params["means"].data = means_new
+    params["w"].data = torch.log(r_new.clamp_min(1e-8))
