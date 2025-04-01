@@ -84,7 +84,7 @@ class DefaultStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 15_000
+    refine_stop_iter: int = 35_000
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0

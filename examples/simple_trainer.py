@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
+import open3d as o3d
 import imageio
 import nerfview
 import numpy as np
@@ -51,10 +52,10 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/fasnacht"
+    #data_dir: str = "/home/paja/data/fasnacht"
     #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
-    #data_dir: str = "/media/paja/T7/vincent/sutro"
+    data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -79,13 +80,13 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 50_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = True
+    save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
@@ -98,7 +99,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 0
+    sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -124,7 +125,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -208,8 +209,22 @@ def create_splats_with_optimizers(
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
+        print("Downsampling")
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+
+        # Target number of points
+        K = 500_000
+
+        # Current number of points
+        N = points.shape[0]
+
+        if K >= N:
+            pass
+        else:
+            indices = torch.randperm(N)[:K]
+            points = points[indices]
+            rgbs = rgbs[indices]
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))

@@ -6,6 +6,7 @@ import multiprocessing as mp
 from typing_extensions import assert_never
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 from PIL import Image
@@ -25,7 +26,8 @@ from .normalize import (
 def compute_frequency_energy(img: torch.Tensor) -> float:
     """
     Computes the 'high-frequency energy' of a single image using DFT,
-    per Eq.(2) in the paper.
+    as in Eq.(2) of your reference paper.
+    Image is expected to be [C,H,W].
     """
     if img.dim() != 3:
         raise ValueError("Image must be [C,H,W].")
@@ -37,93 +39,136 @@ def compute_frequency_energy(img: torch.Tensor) -> float:
         x = img.float()  # [1, H, W] if single channel
 
     fft_img = torch.fft.fft2(x, norm='ortho')
-    mag_sqr = fft_img.real**2 + fft_img.imag**2
+    mag_sqr = fft_img.real ** 2 + fft_img.imag ** 2
     return mag_sqr.sum().item()
 
 
+def process_single_image(
+        img_path: str,
+        device: str,
+        candidate_factors: List[float]
+) -> Tuple[float, Dict[float, float]]:
+    """
+    Load a single image, compute full-resolution frequency energy,
+    and compute the frequency energy for each candidate downsample factor.
+
+    Returns:
+        (full_res_energy, {factor: factor_energy, ...})
+    """
+    # If something fails (bad image, etc.), return None so we can skip
+    try:
+        with Image.open(img_path) as pil_img:
+            # Convert to RGB if needed
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+
+            # Convert to tensor: (C, H, W)
+            img_tensor = transforms.ToTensor()(pil_img).to(device)
+
+            # 1) Full-resolution energy
+            full_energy = compute_frequency_energy(img_tensor)
+
+            # 2) Downsampled energies
+            C, H, W = img_tensor.shape
+            down_energies = {}
+            for r in candidate_factors:
+                h2, w2 = int(H * r), int(W * r)
+                if h2 < 2 or w2 < 2:
+                    # If the downsampling would be too small, skip
+                    continue
+                ds = F.interpolate(
+                    img_tensor.unsqueeze(0), size=(h2, w2), mode="area"
+                ).squeeze(0)
+                down_energies[r] = compute_frequency_energy(ds)
+
+        return full_energy, down_energies
+
+    except Exception as ex:
+        # You might want to log or print errors
+        # print(f"Error processing {img_path}: {ex}")
+        return None, {}
+
+
 def compute_dataset_freq_metrics(
-    image_paths: List[str],
-    device: str = "cuda",
-    batch_size: int = 16  # (Unused here but kept for compatibility)
+        image_paths: List[str],
+        device: str = "cuda",
+        batch_size: int = 16  # unused but retained for signature
 ) -> Tuple[float, List[Tuple[float, float]]]:
     """
     Computes average frequency metrics for full-res and downsampled images.
 
     Args:
-        image_paths: List of paths to images
-        device: Device to use for computation ('cuda' or 'cpu')
-        batch_size: Unused in this version (kept for signature compatibility)
+        image_paths: List of paths to images.
+        device: The device to use (e.g. 'cuda' or 'cpu').
+        batch_size: (Unused) retained for compatibility.
 
     Returns:
         XF_full: Average energy of full-resolution images
-        results: List of (downsample_factor, average_energy) pairs
+        results: List of (downsample_factor, average_energy) pairs, sorted by factor
     """
+
+    # Fail early if no paths
     if not image_paths:
         raise RuntimeError("No image paths provided.")
-
-    compute_device = torch.device(device)
 
     # Candidate downscale factors
     candidate_factors = [1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0, 1.0 / 2.0]
 
-    # Initialize accumulators
-    energies_full_sum = 0.0
-    valid_image_count = 0
+    # Accumulators for full res
+    full_energy_sum = 0.0
+    valid_count = 0
 
     # Factor-wise sums/counters
-    factor_results = {
-        r: {"sum": 0.0, "count": 0} for r in candidate_factors
-    }
+    factor_sums = {r: 0.0 for r in candidate_factors}
+    factor_counts = {r: 0 for r in candidate_factors}
 
-    # No batch processing because of possible shape mismatch.
-    for img_path in image_paths:
-        try:
-            with Image.open(img_path) as pil_img:
-                # Convert to RGB if needed
-                if pil_img.mode != "RGB":
-                    pil_img = pil_img.convert("RGB")
+    # We'll process images in parallel
+    # Decide if you want threads or processes:
+    #   - ThreadPoolExecutor: good if most of your time is I/O (e.g. loading images).
+    #   - ProcessPoolExecutor: can bypass GIL, might help for CPU-bound tasks.
+    # For GPU usage, often single-thread or small concurrency can still be enough.
 
-                # Convert to tensor: (C, H, W)
-                img_tensor = transforms.ToTensor()(pil_img).to(compute_device)
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        # Submit a job for each image
+        futures = []
+        for path in image_paths:
+            futures.append(executor.submit(
+                process_single_image, path, device, candidate_factors
+            ))
 
-                # 1) Compute full-resolution energy
-                e = compute_frequency_energy(img_tensor)
-                energies_full_sum += e
-                valid_image_count += 1
+        # Collect results as they come in
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Frequency Analysis"):
+            result = future.result()
+            if result is None:
+                continue
 
-                # 2) Compute downsampled energy for each factor
-                C, H, W = img_tensor.shape
-                for r in candidate_factors:
-                    h2, w2 = int(H * r), int(W * r)
-                    if h2 < 2 or w2 < 2:
-                        continue
+            full_e, down_energies = result
+            if full_e is None:
+                # If something failed for this image, skip
+                continue
 
-                    # Downsample with 'area' interpolation
-                    ds = F.interpolate(
-                        img_tensor.unsqueeze(0), size=(h2, w2), mode="area"
-                    ).squeeze(0)
-                    e_down = compute_frequency_energy(ds)
-                    factor_results[r]["sum"] += e_down
-                    factor_results[r]["count"] += 1
+            full_energy_sum += full_e
+            valid_count += 1
 
-        except Exception as ex:
-            print(f"Error loading {img_path}: {ex}")
-            continue
+            # Update factor sums
+            for r, down_e in down_energies.items():
+                factor_sums[r] += down_e
+                factor_counts[r] += 1
 
-    if valid_image_count == 0:
+    if valid_count == 0:
         raise RuntimeError("Could not compute frequency energy for any image.")
 
-    # Compute average full-resolution energy
-    XF_full = energies_full_sum / valid_image_count
+    # Average full-resolution
+    XF_full = full_energy_sum / valid_count
 
-    # Compute average energy per downsample factor
+    # Average per factor
     results = []
     for r in candidate_factors:
-        if factor_results[r]["count"] > 0:
-            XFr = factor_results[r]["sum"] / factor_results[r]["count"]
-            results.append((r, XFr))
+        if factor_counts[r] > 0:
+            avg_e = factor_sums[r] / factor_counts[r]
+            results.append((r, avg_e))
 
-    # Sort results by factor
+    # Sort by factor
     results.sort(key=lambda x: x[0])
     return XF_full, results
 
@@ -509,7 +554,6 @@ class Parser:
         dists = np.linalg.norm(self.points - scene_center, axis=1)
         self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
 
-        print("Computing schedule")
         XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
         self.schedule = allocate_iterations_by_frequency(total_iterations, XF_full, down_list)
         print(f"Generated Resolution Schedule (factor, steps): {self.schedule}")
