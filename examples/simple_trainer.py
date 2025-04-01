@@ -51,19 +51,22 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    #data_dir: str = "/home/paja/data/fasnacht"
+    data_dir: str = "/home/paja/data/bike_aliked"
+    #data_dir: str = "/media/paja/T7/vincent/car"
+    #data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 200
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -78,11 +81,11 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
@@ -95,7 +98,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 3
+    sh_degree: int = 0
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -150,7 +153,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -317,7 +320,7 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
@@ -565,6 +568,7 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            self.trainset.update_step(step)
             try:
                 data = next(trainloader_iter)
             except StopIteration:
@@ -678,6 +682,8 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            num_gs = len(self.splats["means"])
+            desc += f"GS={num_gs}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -826,7 +832,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                #self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1055,7 +1061,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
         step = ckpts[0]["step"]
         runner.eval(step=step)
-        runner.render_traj(step=step)
+        #runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:

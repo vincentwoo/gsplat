@@ -2,6 +2,7 @@ import os
 import json
 from tqdm import tqdm
 from typing import Any, Dict, List, Optional
+import multiprocessing as mp
 from typing_extensions import assert_never
 
 import cv2
@@ -327,8 +328,8 @@ class Parser:
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
-        dists = np.linalg.norm(camera_locations - scene_center, axis=1)
-        self.scene_scale = np.max(dists)
+        dists = np.linalg.norm(self.points - scene_center, axis=1)
+        self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
 
 
 class Dataset:
@@ -338,6 +339,7 @@ class Dataset:
         self,
         parser: Parser,
         split: str = "train",
+        warmup_iterations: int = 0,
         patch_size: Optional[int] = None,
         load_depths: bool = False,
     ):
@@ -345,6 +347,9 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.warmup_iterations = warmup_iterations
+        self._step = mp.Value('i', 0)
+
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -372,6 +377,14 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+
+        if self._step.value > 1 and self._step.value <= self.warmup_iterations:
+            scale = 2
+            image = self.downscale_image(image, scale=scale)
+            K = K.copy()
+            K[0:2, :] /= scale
+            if mask is not None:
+                mask = self.downscale_image(mask.astype(np.float32), scale=scale) > 0.5
 
         if self.patch_size is not None:
             # Random crop.
@@ -415,6 +428,18 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
 
         return data
+
+    def downscale_image(self, image: np.ndarray, scale: int) -> np.ndarray:
+        if scale == 1:
+            return image
+        h, w = image.shape[:2]
+        new_h, new_w = h // scale, w //scale
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    def update_step(self, step: int):
+        """Update the shared iteration counter."""
+        with self._step.get_lock():
+            self._step.value = step
 
 
 if __name__ == "__main__":
