@@ -701,7 +701,7 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             num_gs = len(self.splats["means"])
             desc += f"GS={num_gs}| "
-            desc += f"Factor={down_factor.item()}| "
+            desc += f"Factor={down_factor.item():.2f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -832,10 +832,11 @@ class Runner:
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
+                    factor=down_factor ** (2.0 - step / max_steps),
                     info=info,
                     packed=cfg.packed,
                 )
-                if step in [1000, 10_000, 20_000, 30_000, 40_000, 50_000]:
+                if step in [2000, 10_000, 20_000, 32_000, 45_000]:
                     importance_mask = self.importance_score()
                     self.cfg.strategy.prune_mask(params=self.splats,
                                                  optimizers=self.optimizers,

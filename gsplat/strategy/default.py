@@ -84,14 +84,17 @@ class DefaultStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 35_000
+    refine_stop_iter: int = 45_000
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0
     absgrad: bool = False
-    revised_opacity: bool = False
+    revised_opacity: bool = True
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    p_init: int = 0
+    last_p_fin: int = 0
+
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -155,6 +158,7 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        factor: float,
         info: Dict[str, Any],
         packed: bool = False,
     ):
@@ -170,7 +174,7 @@ class DefaultStrategy(Strategy):
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
@@ -230,6 +234,8 @@ class DefaultStrategy(Strategy):
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+            self.p_init = min(5 * n_gaussian, 2_000_000)
+            self.last_p_fin = self.p_init
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
@@ -261,51 +267,125 @@ class DefaultStrategy(Strategy):
 
     @torch.no_grad()
     def _grow_gs(
-        self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
-        step: int,
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            step: int,
+            factor: float
     ) -> Tuple[int, int]:
+        """
+        A version of `_grow_gs` that implements a *budgeted* approach for
+        deciding how many duplications vs. splits can happen, based on largest
+        gradient norms first.
+        """
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
 
+        # Identify the typical thresholds/flags, same as before:
         is_grad_high = grads > self.grow_grad2d
-        is_small = (
-            torch.exp(params["scales"]).max(dim=-1).values
-            <= self.grow_scale3d * state["scene_scale"]
-        )
-        is_dupli = is_grad_high & is_small
-        n_dupli = is_dupli.sum().item()
 
+        # "Small" => duplication candidate
+        is_small = (
+                torch.exp(params["scales"]).max(dim=-1).values
+                <= self.grow_scale3d * state["scene_scale"]
+        )
+        # "Large" => splitting candidate
         is_large = ~is_small
+
+        # initial masks for duplication vs split
+        is_dupli = is_grad_high & is_small
         is_split = is_grad_high & is_large
+
+        # If we haven't yet stopped scale2d refining, also force-split those with bigger radii
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
-        n_split = is_split.sum().item()
 
-        # first duplicate
+        # Combine them to get "candidate_mask" for ANY type of growth
+        candidate_mask = is_dupli | is_split
+        candidate_idxs = candidate_mask.nonzero(as_tuple=False).flatten()
+
+        if candidate_idxs.numel() == 0:
+            return 0, 0  # no candidates => nothing to do
+
+        # Sort candidates by descending gradient magnitude
+        candidate_norms = grads[candidate_idxs]
+        sorted_norms, sorted_rel_idx = torch.sort(candidate_norms, descending=True)
+        sorted_candidate_idxs = candidate_idxs[sorted_rel_idx]
+
+        # ------------------------------------------------------------------------
+        #  BUDGET LOGIC
+        # ------------------------------------------------------------------------
+        p_fin = max(self.last_p_fin, 0.98 * self.last_p_fin + candidate_idxs.numel())
+        self.last_p_fin = p_fin
+        # (Your factor, p_init, etc. come from your original approach)
+        current_count = params["means"].shape[0]  # e.g. how many GS we have
+        budget_left = (self.p_init + (p_fin - self.p_init) / factor) - current_count
+
+        split_cost = 2
+        clone_cost = 1
+
+        # We'll figure out which indices we choose to dupli vs. split
+        chosen_dupli = []
+        chosen_split = []
+
+        for idx in sorted_candidate_idxs:
+            if is_split[idx]:
+                cost = split_cost
+            else:
+                cost = clone_cost
+
+            # If we still have enough budget, choose this idx for that operation
+            if budget_left >= cost:
+                if is_split[idx]:
+                    chosen_split.append(idx.item())
+                else:
+                    chosen_dupli.append(idx.item())
+                budget_left -= cost
+            else:
+                # no more budget => break from loop
+                break
+
+        n_dupli = len(chosen_dupli)
+        n_split = len(chosen_split)
+
+        if n_dupli == 0 and n_split == 0:
+            return 0, 0  # Not enough budget to do anything.
+
+        # Build final boolean masks from the chosen idx lists
+        final_dupli_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        final_split_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
         if n_dupli > 0:
-            duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+            final_dupli_mask[chosen_dupli] = True
+        if n_split > 0:
+            final_split_mask[chosen_split] = True
 
-        # new GSs added by duplication will not be split
-        is_split = torch.cat(
-            [
-                is_split,
-                torch.zeros(n_dupli, dtype=torch.bool, device=device),
-            ]
-        )
+        if n_dupli > 0:
+            duplicate(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                mask=final_dupli_mask,
+            )
 
-        # then split
+        # Newly duplicated points are appended at the end, so we need to extend
+        # final_split_mask with zeros for the new rows added by duplication:
+        if n_dupli > 0:
+            final_split_mask = torch.cat([
+                final_split_mask,
+                torch.zeros(n_dupli, dtype=torch.bool, device=device)
+            ], dim=0)
+
         if n_split > 0:
             split(
                 params=params,
                 optimizers=optimizers,
                 state=state,
-                mask=is_split,
+                mask=final_split_mask,
                 revised_opacity=self.revised_opacity,
             )
+
         return n_dupli, n_split
 
     def prune_mask(
