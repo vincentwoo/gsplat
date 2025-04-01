@@ -52,20 +52,22 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/giraff"
-
+    #data_dir: str = "/home/paja/data/fasnacht"
+    #data_dir: str = "/home/paja/data/bike_aliked"
+    #data_dir: str = "/media/paja/T7/vincent/car"
+    data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "results/sutro_hog"
     # Every N images there is a test image
-    test_every: int = 10000
+    test_every: int = 10_000
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = False
+    normalize_world_space: bool = True
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -80,9 +82,9 @@ class Config:
     # Number of training steps
     max_steps: int = 50_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 25_000, 35_000, 45_000, 50_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
@@ -123,7 +125,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -312,6 +314,7 @@ class Runner:
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
+            total_iterations=cfg.max_steps,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
@@ -323,7 +326,7 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
@@ -458,6 +461,7 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        importance: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
@@ -500,6 +504,7 @@ class Runner:
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
+            importance=importance,
             **kwargs,
         )
         if masks is not None:
@@ -573,6 +578,7 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            self.trainset.update_step(step)
             try:
                 data = next(trainloader_iter)
             except StopIteration:
@@ -581,6 +587,7 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
+            down_factor = data["down_factor"]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
@@ -686,6 +693,9 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            num_gs = len(self.splats["means"])
+            desc += f"GS={num_gs}| "
+            desc += f"Factor={down_factor.item():.2f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -816,9 +826,16 @@ class Runner:
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
+                    factor=down_factor ** (2.0 - step / max_steps),
                     info=info,
                     packed=cfg.packed,
                 )
+                if step in [10_000, 20_000, 32_000, 45_000]:
+                    importance_mask = self.importance_score()
+                    self.cfg.strategy.prune_mask(params=self.splats,
+                                                 optimizers=self.optimizers,
+                                                 state=self.strategy_state,
+                                                 mask=importance_mask)
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -850,6 +867,37 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    @torch.no_grad()
+    def importance_score(self):
+        cfg = self.cfg
+        device = self.device
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        importance = torch.zeros_like(self.splats["opacities"])
+        for i in tqdm.trange(len(camtoworlds_all), desc="Compute importance score"):
+            camtoworlds = camtoworlds_all[i: i + 1]
+            Ks = K[None]
+
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                importance=importance,
+            )  # [1, H, W, 4]
+
+        mask = importance < 0.01
+        print(f"Number of low contributing GS: {mask.sum().item()} with total gaussians: {len(importance)}")
+        return mask
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):

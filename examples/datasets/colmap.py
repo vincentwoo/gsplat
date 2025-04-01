@@ -1,8 +1,12 @@
 import os
 import json
 from tqdm import tqdm
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import multiprocessing as mp
 from typing_extensions import assert_never
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 from PIL import Image
@@ -18,6 +22,225 @@ from .normalize import (
     transform_points,
 )
 
+
+def compute_frequency_energy(img: torch.Tensor) -> float:
+    """
+    Computes the 'high-frequency energy' of a single image using DFT,
+    as in Eq.(2) of your reference paper.
+    Image is expected to be [C,H,W].
+    """
+    if img.dim() != 3:
+        raise ValueError("Image must be [C,H,W].")
+
+    # Sum across color channels for a single-luma approach
+    if img.shape[0] > 1:
+        x = img.float().mean(dim=0, keepdim=True)  # [1, H, W]
+    else:
+        x = img.float()  # [1, H, W] if single channel
+
+    fft_img = torch.fft.fft2(x, norm='ortho')
+    mag_sqr = fft_img.real ** 2 + fft_img.imag ** 2
+    return mag_sqr.sum().item()
+
+
+def process_single_image(
+        img_path: str,
+        device: str,
+        candidate_factors: List[float]
+) -> Tuple[float, Dict[float, float]]:
+    """
+    Load a single image, compute full-resolution frequency energy,
+    and compute the frequency energy for each candidate downsample factor.
+
+    Returns:
+        (full_res_energy, {factor: factor_energy, ...})
+    """
+    # If something fails (bad image, etc.), return None so we can skip
+    try:
+        with Image.open(img_path) as pil_img:
+            # Convert to RGB if needed
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+
+            # Convert to tensor: (C, H, W)
+            img_tensor = transforms.ToTensor()(pil_img).to(device)
+
+            # 1) Full-resolution energy
+            full_energy = compute_frequency_energy(img_tensor)
+
+            # 2) Downsampled energies
+            C, H, W = img_tensor.shape
+            down_energies = {}
+            for r in candidate_factors:
+                h2, w2 = int(H * r), int(W * r)
+                if h2 < 2 or w2 < 2:
+                    # If the downsampling would be too small, skip
+                    continue
+                ds = F.interpolate(
+                    img_tensor.unsqueeze(0), size=(h2, w2), mode="area"
+                ).squeeze(0)
+                down_energies[r] = compute_frequency_energy(ds)
+
+        return full_energy, down_energies
+
+    except Exception as ex:
+        # You might want to log or print errors
+        # print(f"Error processing {img_path}: {ex}")
+        return None, {}
+
+
+def compute_dataset_freq_metrics(
+        image_paths: List[str],
+        device: str = "cuda",
+        batch_size: int = 16  # unused but retained for signature
+) -> Tuple[float, List[Tuple[float, float]]]:
+    """
+    Computes average frequency metrics for full-res and downsampled images.
+
+    Args:
+        image_paths: List of paths to images.
+        device: The device to use (e.g. 'cuda' or 'cpu').
+        batch_size: (Unused) retained for compatibility.
+
+    Returns:
+        XF_full: Average energy of full-resolution images
+        results: List of (downsample_factor, average_energy) pairs, sorted by factor
+    """
+
+    # Fail early if no paths
+    if not image_paths:
+        raise RuntimeError("No image paths provided.")
+
+    # Candidate downscale factors
+    candidate_factors = [1.0 / 5.0, 1.0 / 4.0, 1.0 / 3.0, 1.0 / 2.0]
+
+    # Accumulators for full res
+    full_energy_sum = 0.0
+    valid_count = 0
+
+    # Factor-wise sums/counters
+    factor_sums = {r: 0.0 for r in candidate_factors}
+    factor_counts = {r: 0 for r in candidate_factors}
+
+    # We'll process images in parallel
+    # Decide if you want threads or processes:
+    #   - ThreadPoolExecutor: good if most of your time is I/O (e.g. loading images).
+    #   - ProcessPoolExecutor: can bypass GIL, might help for CPU-bound tasks.
+    # For GPU usage, often single-thread or small concurrency can still be enough.
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        # Submit a job for each image
+        futures = []
+        for path in image_paths:
+            futures.append(executor.submit(
+                process_single_image, path, device, candidate_factors
+            ))
+
+        # Collect results as they come in
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Frequency Analysis"):
+            result = future.result()
+            if result is None:
+                continue
+
+            full_e, down_energies = result
+            if full_e is None:
+                # If something failed for this image, skip
+                continue
+
+            full_energy_sum += full_e
+            valid_count += 1
+
+            # Update factor sums
+            for r, down_e in down_energies.items():
+                factor_sums[r] += down_e
+                factor_counts[r] += 1
+
+    if valid_count == 0:
+        raise RuntimeError("Could not compute frequency energy for any image.")
+
+    # Average full-resolution
+    XF_full = full_energy_sum / valid_count
+
+    # Average per factor
+    results = []
+    for r in candidate_factors:
+        if factor_counts[r] > 0:
+            avg_e = factor_sums[r] / factor_counts[r]
+            results.append((r, avg_e))
+
+    # Sort by factor
+    results.sort(key=lambda x: x[0])
+    return XF_full, results
+
+
+def allocate_iterations_by_frequency(S, XF_full, down_list):
+    """
+    Allocates iteration counts per stage based on frequency energy ratios (Eq. 6/7).
+    """
+    used = 0
+    schedule = []
+    # Ensure XF_full is not zero to avoid division by zero
+    if XF_full <= 1e-9:
+        print("Warning: Full frequency energy is near zero. Falling back to equal allocation.")
+        # Fallback: allocate equally minus 1 step for full res
+        num_stages = len(down_list) + 1
+        steps_per_stage = S // num_stages
+        for factor, _ in down_list:
+            schedule.append((factor, steps_per_stage))
+            used += steps_per_stage
+        leftover = S - used
+        schedule.append((1.0, leftover))
+        return schedule
+
+    for (factor, XFr) in down_list:
+        frac = max(0.0, XFr / XF_full)  # Clamp fraction just in case
+        steps = int(S * frac)
+        if steps > 0:
+            schedule.append((factor, steps))
+            used += steps
+
+    leftover = S - used
+    if leftover > 0:
+        schedule.append((1.0, leftover))
+    elif not any(f == 1.0 for f, s in schedule):  # Ensure full res stage exists
+        # Steal one step from the last stage if possible
+        if schedule:
+            last_factor, last_steps = schedule[-1]
+            if last_steps > 1:
+                schedule[-1] = (last_factor, last_steps - 1)
+                schedule.append((1.0, 1))
+            else:  # Cannot steal, just add a 1-step full res phase
+                schedule.append((1.0, 1))
+        else:  # No downsample stages, all full res
+            schedule.append((1.0, S))
+
+    # Normalize steps if they don't sum up exactly to S due to int() rounding
+    current_total_steps = sum(s for f, s in schedule)
+    if current_total_steps != S and current_total_steps > 0:
+        # print(f"Adjusting schedule steps from {current_total_steps} to {S}")
+        diff = S - current_total_steps
+        # Add/remove difference to/from the longest stage (usually full-res)
+        longest_stage_idx = -1
+        max_steps = -1
+        for idx, (f, s) in enumerate(schedule):
+            if s > max_steps:
+                max_steps = s
+                longest_stage_idx = idx
+
+        if longest_stage_idx != -1:
+            adj_factor, adj_steps = schedule[longest_stage_idx]
+            new_steps = max(1, adj_steps + diff)  # Ensure stage has at least 1 step
+            schedule[longest_stage_idx] = (adj_factor, new_steps)
+            # Recalculate total and handle potential overshoot/undershoot again if needed (rare)
+            final_total = sum(s for f, s in schedule)
+            if final_total != S:
+                # As a final fallback, just dump remainder into the last stage
+                final_diff = S - final_total
+                last_f, last_s = schedule[-1]
+                schedule[-1] = (last_f, max(1, last_s + final_diff))
+                # print(f"Final schedule adjustment: total steps {sum(s for f, s in schedule)}")
+
+    return schedule
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -60,6 +283,7 @@ class Parser:
         self,
         data_dir: str,
         factor: int = 1,
+        total_iterations: int = 30_000,
         normalize: bool = False,
         test_every: int = 8,
     ):
@@ -327,12 +551,17 @@ class Parser:
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
-        dists = np.linalg.norm(camera_locations - scene_center, axis=1)
-        self.scene_scale = np.max(dists)
+        dists = np.linalg.norm(self.points - scene_center, axis=1)
+        self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
 
+        XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
+        self.schedule = allocate_iterations_by_frequency(total_iterations, XF_full, down_list)
+        print(f"Generated Resolution Schedule (factor, steps): {self.schedule}")
+        if sum(s for f, s in self.schedule) != total_iterations:
+            print(f"Warning: Schedule steps sum to {sum(s for f, s in self.schedule)}, expected {total_iterations}. Check allocation logic.")
 
 class Dataset:
-    """A simple dataset class."""
+    """A simple dataset class that downscales images according to a schedule."""
 
     def __init__(
         self,
@@ -345,6 +574,22 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+
+        # A multiprocessing.Value to track the global iteration or "step"
+        self._step = mp.Value('i', 0)
+
+        # We now incorporate the resolution schedule from the parser
+        # schedule is a list of (down_factor, steps)
+        self.schedule = parser.schedule
+
+        # Convert schedule into a "cumulative" list for quick factor lookup
+        self._cumulative_schedule = []
+        running = 0
+        for (factor, steps) in self.schedule:
+            running += steps
+            self._cumulative_schedule.append((factor, running))
+
+        # We will pick training vs test images by modding with test_every
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -354,67 +599,113 @@ class Dataset:
     def __len__(self):
         return len(self.indices)
 
+    def get_down_factor_for_step(self, step: int) -> float:
+        """
+        Return the resolution down_factor for the given global 'step'
+        by walking through the cumulative schedule.
+        """
+        for (factor, accum_step) in self._cumulative_schedule:
+            if step <= accum_step:
+                return factor
+        # If for some reason we exceed the last stage, default to 1.0
+        return 1.0
+
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
+        camtoworld = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
-            mapx, mapy = (
-                self.parser.mapx_dict[camera_id],
-                self.parser.mapy_dict[camera_id],
-            )
+        # If there's camera distortion, undistort
+        if len(params) > 0 and camera_id in self.parser.mapx_dict:
+            mapx = self.parser.mapx_dict[camera_id]
+            mapy = self.parser.mapy_dict[camera_id]
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
 
-        if self.patch_size is not None:
-            # Random crop.
-            h, w = image.shape[:2]
-            x = np.random.randint(0, max(w - self.patch_size, 1))
-            y = np.random.randint(0, max(h - self.patch_size, 1))
-            image = image[y : y + self.patch_size, x : x + self.patch_size]
-            K[0, 2] -= x
-            K[1, 2] -= y
+        # Now apply the "frequency-based scheduling" factor
+        step_now = self._step.value
+        down_factor = self.get_down_factor_for_step(step_now)
 
+        if down_factor < 1.0:
+            # e.g. if factor=0.25 => new size = 25% of original
+            image = self.downscale_image_by_factor(image, down_factor)
+            # Adjust the intrinsics
+            K[0:2, :] *= down_factor
+            if mask is not None:
+                mask = self.downscale_image_by_factor(mask.astype(np.float32), down_factor) > 0.5
+
+        # Optionally do patches
+        if self.patch_size is not None:
+            h, w = image.shape[:2]
+            x0 = np.random.randint(0, max(w - self.patch_size, 1))
+            y0 = np.random.randint(0, max(h - self.patch_size, 1))
+            image = image[y0 : y0 + self.patch_size, x0 : x0 + self.patch_size]
+            K[0, 2] -= x0
+            K[1, 2] -= y0
+            if mask is not None:
+                mask = mask[y0 : y0 + self.patch_size, x0 : x0 + self.patch_size]
+
+        # Prepare outputs
         data = {
             "K": torch.from_numpy(K).float(),
-            "camtoworld": torch.from_numpy(camtoworlds).float(),
+            "camtoworld": torch.from_numpy(camtoworld).float(),
             "image": torch.from_numpy(image).float(),
-            "image_id": item,  # the index of the image in the dataset
+            "image_id": item,  # the index in the dataset
+            "down_factor": down_factor,
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
+        # If we want to load (sparse) depth from 3D points:
         if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
+            # Project 3D points into the camera
+            worldtocam = np.linalg.inv(camtoworld)
             image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
+            point_indices = self.parser.point_indices.get(image_name, [])
             points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+            points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
             points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
+            pts_xy = points_proj[:, :2] / points_proj[:, 2:3]
+            pts_depth = points_cam[:, 2]
+
+            # Filter out invalid
+            h, w = image.shape[:2]
+            valid = (
+                (pts_xy[:, 0] >= 0)
+                & (pts_xy[:, 0] < w)
+                & (pts_xy[:, 1] >= 0)
+                & (pts_xy[:, 1] < h)
+                & (pts_depth > 0)
             )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+            pts_xy = pts_xy[valid]
+            pts_depth = pts_depth[valid]
+            data["points"] = torch.from_numpy(pts_xy).float()
+            data["depths"] = torch.from_numpy(pts_depth).float()
 
         return data
+
+    def downscale_image_by_factor(self, image: np.ndarray, factor: float) -> np.ndarray:
+        """
+        Downscale the input image by a float factor < 1.0 using AREA interpolation.
+        """
+        h, w = image.shape[:2]
+        new_h = int(round(h * factor))
+        new_w = int(round(w * factor))
+        if new_h < 2 or new_w < 2:
+            # For safety, clamp
+            new_h = max(new_h, 2)
+            new_w = max(new_w, 2)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    def update_step(self, step: int):
+        """Update the global step from outside, e.g. in your training loop."""
+        with self._step.get_lock():
+            self._step.value = step
 
 
 if __name__ == "__main__":

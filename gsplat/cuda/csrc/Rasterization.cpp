@@ -30,7 +30,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    at::optional<at::Tensor> importance
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -73,8 +74,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             flatten_ids,                                                       \
             renders,                                                           \
             alphas,                                                            \
-            last_ids                                                           \
-        );                                                                     \
+            last_ids,                                                          \
+            importance                                                          \
+        );                                                                      \
         break;
 
     // TODO: an optimization can be done by passing the actual number of
