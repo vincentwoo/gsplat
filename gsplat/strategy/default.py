@@ -308,6 +308,15 @@ class DefaultStrategy(Strategy):
             )
         return n_dupli, n_split
 
+    def prune_mask(
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            mask,
+    ):
+        remove(params=params, optimizers=optimizers, state=state, mask=mask)
+
     @torch.no_grad()
     def _prune_gs(
         self,

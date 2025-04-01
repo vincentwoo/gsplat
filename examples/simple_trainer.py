@@ -6,7 +6,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
-import open3d as o3d
 import imageio
 import nerfview
 import numpy as np
@@ -209,22 +208,21 @@ def create_splats_with_optimizers(
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
-        print("Downsampling")
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
 
         # Target number of points
-        K = 500_000
+       # K = 500_000
 
-        # Current number of points
-        N = points.shape[0]
+       # # Current number of points
+       # N = points.shape[0]
 
-        if K >= N:
-            pass
-        else:
-            indices = torch.randperm(N)[:K]
-            points = points[indices]
-            rgbs = rgbs[indices]
+       # if K >= N:
+       #     pass
+       # else:
+       #     indices = torch.randperm(N)[:K]
+       #     points = points[indices]
+       #     rgbs = rgbs[indices]
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -471,6 +469,7 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        importance: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -514,6 +513,7 @@ class Runner:
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
+            importance=importance,
             **kwargs,
         )
         if masks is not None:
@@ -835,6 +835,12 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                if step in [1000, 10_000, 20_000, 30_000, 40_000, 50_000]:
+                    importance_mask = self.importance_score()
+                    self.cfg.strategy.prune_mask(params=self.splats,
+                                                 optimizers=self.optimizers,
+                                                 state=self.strategy_state,
+                                                 mask=importance_mask)
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -866,6 +872,37 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    @torch.no_grad()
+    def importance_score(self):
+        cfg = self.cfg
+        device = self.device
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        importance = torch.zeros_like(self.splats["opacities"])
+        for i in tqdm.trange(len(camtoworlds_all), desc="Compute importance score"):
+            camtoworlds = camtoworlds_all[i: i + 1]
+            Ks = K[None]
+
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                importance=importance,
+            )  # [1, H, W, 4]
+
+        mask = importance < 0.01
+        print(f"Number of low contributing GS: {mask.sum().item()} with total gaussians: {len(importance)}")
+        return mask
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
