@@ -52,16 +52,17 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
+    data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
     #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
-    data_dir: str = "/media/paja/T7/vincent/sutro"
+    #data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/sutro_hog"
     # Every N images there is a test image
-    test_every: int = 10_000
+    test_every: int = 8
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -154,7 +155,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = True
+    use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -568,6 +569,11 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+        if "importance" in self.strategy_state and self.strategy_state["importance"] is None:
+            self.strategy_state["importance"] = torch.zeros_like(self.splats["opacities"], device=device)
+        else:
+            raise
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -830,7 +836,7 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
-                if step in [10_000, 20_000, 32_000, 45_000]:
+                if step == self.cfg.strategy.refine_stop_iter:
                     importance_mask = self.importance_score()
                     self.cfg.strategy.prune_mask(params=self.splats,
                                                  optimizers=self.optimizers,
