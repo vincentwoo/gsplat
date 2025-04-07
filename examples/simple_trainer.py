@@ -222,7 +222,7 @@ def create_splats_with_optimizers(
     points *=  w.unsqueeze(1)
     w = torch.log(w)
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(torch.from_numpy(parser.points).float(), 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     scales = torch.log(torch.sqrt(dist2_avg) * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
