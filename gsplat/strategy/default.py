@@ -94,6 +94,8 @@ class DefaultStrategy(Strategy):
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     p_init: int = 0
     last_p_fin: int = 0
+    alpha_t: float = 1.0
+    alpha_g: float = 0.2
 
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -385,6 +387,8 @@ class DefaultStrategy(Strategy):
                 state=state,
                 mask=final_split_mask,
                 revised_opacity=self.revised_opacity,
+                alpha_t=self.alpha_t,
+                alpha_g=self.alpha_g,
             )
 
         return n_dupli, n_split

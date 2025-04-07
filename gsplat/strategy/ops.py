@@ -122,77 +122,215 @@ def duplicate(
 
 @torch.no_grad()
 def split(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
-    revised_opacity: bool = False,
+        params: Dict[str, torch.nn.Parameter],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, torch.Tensor],
+        mask: torch.Tensor,
+        revised_opacity: bool = False,
+        alpha_t: float = 1.0,
+        alpha_g: float = 0.2,
 ):
-    """Inplace split the Gaussians with the given mask.
+    """
+    Split each selected Gaussian (where `mask[i] == True`) into 2 children.
+
+    This version:
+      • Uses *homogeneous coordinates* by referencing a parameter "w".
+      • Recomputes new means from polar coords: xyz -> (r, w, phi), etc.
+      • Logs and reassigns "w" so that new children get a consistent homogeneous coordinate.
+      • Partially inherits optimizer states for "exp_avg" and "exp_avg_sq", etc.
+      • Leaves ephemeral `state[...]` buffers with 2 new zero rows for each splitted Gaussian.
 
     Args:
-        params: A dictionary of parameters.
-        optimizers: A dictionary of optimizers, each corresponding to a parameter.
-        state: A dictionary of extra running states (Tensors).
-        mask: A boolean mask (True => the Gaussians to be split).
-        revised_opacity: Whether to use the revised opacity formulation
-            from arXiv:2404.06109. Default: False.
+      params: Dictionary of all model parameters, including "means", "scales", "quats", "opacities", and "w".
+      optimizers: Dictionary of corresponding optimizers (e.g. Adam).
+      state: Extra running states (like "grad2d", "count", etc.).
+      mask: Boolean mask, shape [N], indicating which Gaussians to split.
+      revised_opacity: If True, apply revised opacity from arXiv:2404.06109.
+      alpha_t, alpha_g: partial-inheritance factors for the optimizer's Adam states.
     """
+
     device = mask.device
-    sel = torch.where(mask)[0]
-    rest = torch.where(~mask)[0]
+    sel = torch.where(mask)[0]  # indices of the "mother" Gaussians
+    rest = torch.where(~mask)[0]  # indices of the remaining (father) Gaussians
+    N_sel = len(sel)
+    if N_sel == 0:
+        return  # nothing to split
 
-    w_inv = 1 / torch.exp(params["w"][sel]).unsqueeze(1)
+    old_count = len(rest) + len(sel)  # total before splitting
+    new_count = len(rest) + 2 * N_sel  # total after splitting
 
-    means = params["means"][sel]
-    scales = (
-        torch.exp(params["scales"][sel])
-        * w_inv
-        * torch.norm(means, dim=1).unsqueeze(1)
-    )
-    quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)
+    # 1) Compute new child "means" using homogeneous coords
+    #    (like your original snippet).
+    mother_w = params["w"][sel]  # shape [N_sel]
+    w_inv = 1.0 / torch.exp(mother_w).unsqueeze(1)  # shape [N_sel, 1]
 
-    samples = torch.einsum(
-        "nij,nj,bnj->bni",
-        rotmats,
-        scales,
-        torch.randn(2, len(scales), 3, device=device),
-    )
+    mother_means = params["means"][sel]  # shape [N_sel, 3]
+    # scales = exp(params["scales"]) * w_inv * ||means||
+    # the old code does this:
+    r_means = torch.norm(mother_means, dim=1).unsqueeze(1)  # shape [N_sel, 1]
+    mother_scales = torch.exp(params["scales"][sel]) * w_inv * r_means
+    # Rotation from quats:
+    mother_quats = F.normalize(params["quats"][sel], dim=-1)  # shape [N_sel, 4]
+    rotmats = normalized_quat_to_rotmat(mother_quats)  # shape [N_sel, 3,3]
 
-    new_means = (means * w_inv + samples).reshape(-1, 3)
-    _, new_w, _ = xyz_to_polar(new_means)
-    new_means = new_means * new_w.unsqueeze(1)
+    # sample 2 random offsets per mother, shape [2, N_sel, 3]
+    rand_samples = torch.randn(2, N_sel, 3, device=device)
+    # local_shifts = R * scales * random
+    local_shifts = torch.einsum("nij,nj,bnj->bni", rotmats, mother_scales, rand_samples)
 
-    def param_fn(name: str, p: Tensor) -> Tensor:
-        repeats = [2] + [1] * (p.dim() - 1)
+    # new_means in "Cartesian coords" = (mother_means * w_inv + local_shifts)
+    # shape => [2, N_sel, 3] => flatten => [2*N_sel, 3]
+    child_means_cart = (mother_means * w_inv + local_shifts).reshape(-1, 3)
+
+    # Then convert back to polar => w, etc.
+    # We'll define a helper function (like your original xyz_to_polar).
+    # If you already have xyz_to_polar in your code, use that.  We'll show a small mock version below:
+    # (r, w, phi) = xyz_to_polar(cart)
+    # then child_means = cart * w
+    new_r, new_w, new_phi = xyz_to_polar(child_means_cart)  # each shape [2*N_sel]
+    # final child means in homogeneous coords => cart * w
+    child_means = child_means_cart * new_w.unsqueeze(1)
+
+    ####################################################
+    # 2) Build param_fn for all param keys
+    ####################################################
+    def param_fn(name: str, p: torch.Tensor) -> torch.Tensor:
+        """
+        For each param name, produce the new [new_count, ...] parameter data,
+        reusing the "father" rows from `rest` plus new splitted rows for `sel`.
+        """
+        if p.shape[0] != old_count:
+            # not a per-Gaussian param, skip
+            return p
+
+        # father part
+        father_part = p[rest]
+        mother_part = p[sel]
+
         if name == "means":
-            p_split = new_means
+            # We just computed 'child_means' above, shape [2*N_sel, 3]
+            splitted = child_means
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
+
         elif name == "scales":
-            p_split = torch.log(torch.exp(params["scales"][sel]) / 1.6).repeat(2, 1)
-        elif name == "opacities" and revised_opacity:
-            new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
-            p_split = torch.logit(new_opacities).repeat(repeats)
+            # replicate the old logic: new scales = log(scales/1.6)
+            splitted = torch.log(torch.exp(params["scales"][sel]) / 1.6).repeat(2, 1)
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
+
+        elif name == "quats":
+            # replicate mother quats 2x
+            splitted = mother_part.repeat(2, 1)
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
+
+        elif name == "opacities":
+            if revised_opacity:
+                # revised => 1 - sqrt(1 - sigmoid(...))
+                sigm = torch.sigmoid(mother_part)
+                new_sigm = 1.0 - torch.sqrt(1.0 - sigm)
+                splitted = torch.logit(new_sigm).repeat(2)
+            else:
+                # normal => replicate mother
+                splitted = mother_part.repeat(2)
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
+
         elif name == "w":
-            p_split = torch.log(new_w)
+            # we do: new w = log(new_w)
+            # new_w is shape [2*N_sel]. => no .repeat needed, it’s already 2*N_sel
+            splitted = torch.log(new_w)
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
+
         else:
-            p_split = p[sel].repeat(repeats)
-        p_new = torch.cat([p[rest], p_split])
-        p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
-        return p_new
+            # default: replicate mother row 2x
+            # shape: [old_count, ...]
+            splitted = mother_part.repeat(2, *[1] * (p.ndim - 1))
+            new_p = torch.cat([father_part, splitted], dim=0)
+            return torch.nn.Parameter(new_p, requires_grad=p.requires_grad)
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
-        return torch.cat([v[rest], v_split])
+    ####################################################
+    # 3) Build optimizer_fn for partial inheritance
+    ####################################################
+    def optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
+        """
+        For each key in the optimizer state (e.g. 'exp_avg', 'exp_avg_sq', etc.),
+        produce the new per-Gaussian array with partial inheritance.
+        """
+        if not isinstance(v, torch.Tensor):
+            return v
+        if v.dim() == 0 or v.shape[0] != old_count:
+            return v
 
-    # update the parameters and the state in the optimizers
-    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
-    # update the extra running state
+        father_vals = v[rest]
+        mother_vals = v[sel]
+
+        if key == "exp_avg":
+            c1 = alpha_g * mother_vals
+            c2 = alpha_g * mother_vals
+        elif key == "exp_avg_sq":
+            c1 = (alpha_g ** 2) * mother_vals
+            c2 = (alpha_g ** 2) * mother_vals
+        else:
+            # e.g. zero them out or do alpha_t if you have 'lifespan'
+            c1 = torch.zeros_like(mother_vals)
+            c2 = torch.zeros_like(mother_vals)
+
+        splitted = torch.cat([c1, c2], dim=0)
+        return torch.cat([father_vals, splitted], dim=0)
+
+    ####################################################
+    # 4) Actually update the params + optimizer states
+    ####################################################
+    def _update_param_with_optimizer(
+            param_fn: Callable[[str, torch.Tensor], torch.Tensor],
+            optimizer_fn: Callable[[str, torch.Tensor], torch.Tensor],
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            names: Union[List[str], None] = None,
+    ):
+        if names is None:
+            names = list(params.keys())
+        for name in names:
+            old_p = params[name]
+            new_p = param_fn(name, old_p)
+            params[name] = new_p
+
+            if name in optimizers:
+                opt = optimizers[name]
+                # Typically 1 param group
+                for group in opt.param_groups:
+                    if old_p in group["params"]:
+                        group["params"].remove(old_p)
+                    if new_p not in group["params"]:
+                        group["params"].append(new_p)
+
+                if old_p in opt.state:
+                    old_state = opt.state.pop(old_p)
+                    new_state = {}
+                    for k_, v_ in old_state.items():
+                        new_state[k_] = optimizer_fn(k_, v_)
+                    opt.state[new_p] = new_state
+
+    # Call the update
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers, names=None)
+
+    ####################################################
+    # 5) Update ephemeral states in `state`
+    ####################################################
     for k, v in state.items():
-        if isinstance(v, torch.Tensor):
-            repeats = [2] + [1] * (v.dim() - 1)
-            v_new = v[sel].repeat(repeats)
-            state[k] = torch.cat((v[rest], v_new))
+        if not isinstance(v, torch.Tensor):
+            continue
+        if v.shape[0] != old_count:
+            continue  # mismatch => skip
+
+        father_part = v[rest]
+        mother_part = v[sel]
+        zero_part = torch.zeros_like(mother_part)
+        splitted = torch.cat([zero_part, zero_part], dim=0)  # shape [2*N_sel, ...]
+        state[k] = torch.cat([father_part, splitted], dim=0)
 
 
 @torch.no_grad()
