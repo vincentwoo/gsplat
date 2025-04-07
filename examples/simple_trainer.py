@@ -62,13 +62,17 @@ class Config:
     # Directory to save results
     result_dir: str = "results/sutro_hog"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 10_000
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
     normalize_world_space: bool = True
+    # downscale
+    downscale: bool = True
+    # downscale_init
+    downscale_init_points: int = 500_000
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -85,7 +89,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000, 60_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
@@ -155,9 +159,14 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
+
+    # Exposure
+    use_exposure: bool = True
+    # Exposure learning rate
+    exposure_lr: float = 1e-3
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
@@ -191,6 +200,45 @@ class Config:
         else:
             assert_never(strategy)
 
+class ExposureModule(torch.nn.Module):
+    def __init__(self, num_images):
+        super().__init__()
+        # exposure: shape [num_images, 3, 4]
+        self.exposure = torch.nn.Parameter(
+            torch.eye(3, 4, device="cuda")
+            .unsqueeze(0)
+            .repeat(num_images, 1, 1)
+        )
+
+    def forward(self, rendered_colors: torch.Tensor, image_ids: torch.Tensor):
+        """
+        Args:
+          rendered_colors: shape [B, H, W, 3]
+          image_ids:       shape [B] (each entry is the index for which exposure to use)
+        Returns:
+          The exposed colors, same shape [B, H, W, 3].
+        """
+
+        batch_exposures = self.exposure[image_ids]  # shape [B, 3, 4]
+
+        # 2) Flatten [B, H, W, 3] -> [B, H*W, 3]
+        B, H, W, C = rendered_colors.shape
+        colors_2d = rendered_colors.view(B, H * W, C)  # shape [B, H*W, 3]
+
+        # Separate out the linear part (3×3) and bias (3×1)
+        linear = batch_exposures[:, :, :3]  # shape [B, 3, 3]
+        bias   = batch_exposures[:, :, 3]   # shape [B, 3]
+
+        # 3) Batch multiply each pixel by the 3×3, then add the bias
+        # [B, H*W, 3] x [B, 3, 3] => [B, H*W, 3]
+        colors_2d = torch.bmm(colors_2d, linear.transpose(1, 2))
+
+        colors_2d = colors_2d + bias.unsqueeze(1)  # shape [B, 1, 3]
+
+        # 5) Reshape back to [B, H, W, 3]
+        exposed = colors_2d.view(B, H, W, 3)
+        return exposed
+
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -204,6 +252,8 @@ def create_splats_with_optimizers(
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
+    downscale: bool = False,
+    downscale_init_points: int = 500_000,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
     world_rank: int = 0,
@@ -212,6 +262,12 @@ def create_splats_with_optimizers(
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        if downscale and points.shape[0] > downscale_init_points:
+            initial_number = points.shape[0]
+            indices = torch.randperm(points.shape[0])[:downscale_init_points]
+            points = points[indices]
+            rgbs = rgbs[indices]
+            print(f"Downsampling from {initial_number} to {downscale_init_points}")
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -342,6 +398,8 @@ class Runner:
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
+            downscale=cfg.downscale,
+            downscale_init_points=cfg.downscale_init_points,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
@@ -425,10 +483,25 @@ class Runner:
             self.bil_grid_optimizers = [
                 torch.optim.Adam(
                     self.bil_grids.parameters(),
-                    lr=2e-3 * math.sqrt(cfg.batch_size),
+                    lr=2e-4 * math.sqrt(cfg.batch_size),
                     eps=1e-15,
                 ),
             ]
+
+        self.exposure_optimizers = []
+        if cfg.use_exposure:
+            # Wrap the exposure parameter in a module
+            self.exposure_module = ExposureModule(len(self.trainset.indices)).to(self.device)
+
+            # Create the optimizer from the module’s parameters
+            self.exposure_optimizers = [
+                torch.optim.Adam(
+                    self.exposure_module.parameters(),
+                    lr=cfg.exposure_lr * math.sqrt(cfg.batch_size),
+                )
+            ]
+            if world_size > 1:
+                self.exposure_module = DDP(self.exposure_module)
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -510,6 +583,8 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
+        if self.cfg.use_exposure and image_ids is not None:
+            render_colors = self.exposure_module(render_colors, image_ids)
         return render_colors, render_alphas, info
 
     def train(self):
@@ -556,6 +631,12 @@ class Runner:
                             self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                         ),
                     ]
+                )
+            )
+        if cfg.use_exposure:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.exposure_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
 
@@ -820,6 +901,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.exposure_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
