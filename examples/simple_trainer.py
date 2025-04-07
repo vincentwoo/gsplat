@@ -85,7 +85,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 50_000
+    max_steps: int = 60_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
