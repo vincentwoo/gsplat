@@ -530,7 +530,7 @@ def rasterization(
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
-        render_colors, render_alphas = [], []
+        render_colors, render_alphas, pixels = [], [], []
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -538,7 +538,7 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_ = rasterize_to_pixels(
+            render_colors_, render_alphas_, pixels_ = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors_chunk,
@@ -548,6 +548,7 @@ def rasterization(
                 tile_size,
                 isect_offsets,
                 flatten_ids,
+                depths,
                 backgrounds=backgrounds_chunk,
                 packed=packed,
                 absgrad=absgrad,
@@ -555,10 +556,12 @@ def rasterization(
             )
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
+            pixels.append(pixels_)
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
+        meta.update({"pixels": torch.cat(pixels, dim=-1)})
     else:
-        render_colors, render_alphas = rasterize_to_pixels(
+        render_colors, render_alphas, pixels = rasterize_to_pixels(
             means2d,
             conics,
             colors,
@@ -568,11 +571,13 @@ def rasterization(
             tile_size,
             isect_offsets,
             flatten_ids,
+            depths,
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
             importance=importance,
         )
+        meta.update({"pixels": pixels})
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(

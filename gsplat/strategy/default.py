@@ -234,6 +234,7 @@ class DefaultStrategy(Strategy):
             "width",
             "height",
             "n_cameras",
+            "pixels",
             "radii",
             "gaussian_ids",
             self.key_for_gradient,
@@ -266,15 +267,17 @@ class DefaultStrategy(Strategy):
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz]
             radii = info["radii"].max(dim=-1).values  # [nnz]
+            pixels = torch.ones_like(radii)
         else:
             # grads is [C, N, 2]
             sel = (info["radii"] > 0.0).all(dim=-1)  # [C, N]
             gs_ids = torch.where(sel)[1]  # [nnz]
             grads = grads[sel]  # [nnz, 2]
             radii = info["radii"][sel].max(dim=-1).values  # [nnz]
-        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+            pixels = info["pixels"][sel]
+        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1) * pixels)
         state["count"].index_add_(
-            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32) * pixels
         )
         if self.refine_scale2d_stop_iter > 0:
             # Should be ideally using scatter max

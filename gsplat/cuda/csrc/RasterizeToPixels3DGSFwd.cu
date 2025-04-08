@@ -54,6 +54,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids,        // [C, image_height, image_width]
+    int32_t *__restrict__ pixels,
     scalar_t *__restrict__ importance
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
@@ -176,6 +177,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
 
             int32_t g = id_batch[t];
             const float vis = alpha * T;
+            atomicAdd(&pixels[g], 1);
             if (importance) {
                 atomicMaxFloat(&importance[g], vis);
             }
@@ -228,6 +230,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor alphas,  // [C, image_height, image_width]
     at::Tensor last_ids,// [C, image_height, image_width]
+    at::Tensor pixels,
     at::optional<at::Tensor> importance
 ) {
     bool packed = means2d.dim() == 2;
@@ -284,6 +287,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
+            pixels.data_ptr<int32_t>(),
             importance.has_value() ? importance.value().data_ptr<float>() : nullptr
         );
 }
@@ -307,6 +311,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
         at::Tensor last_ids,                                                   \
+        at::Tensor pixels,                                                   \
         at::optional<at::Tensor> importance                                     \
     );
 

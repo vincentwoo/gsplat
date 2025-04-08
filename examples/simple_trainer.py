@@ -55,10 +55,11 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     #data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
-    data_dir: str = "/home/paja/data/bike_aliked"
+    #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
+    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -72,7 +73,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # downscale
-    downscale: bool = True
+    downscale: bool = False
     # downscale_init
     downscale_init_points: int = 500_000
     # Camera model
