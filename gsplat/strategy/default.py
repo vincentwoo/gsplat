@@ -215,6 +215,13 @@ class DefaultStrategy(Strategy):
                 self.prune_mask(params, optimizers, state, mask)
 
             print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
+            if step < self.refine_stop_iter / 3:
+                reset_opa(
+                        params=params,
+                        optimizers=optimizers,
+                        state=state,
+                        value=self.prune_opa * 2.0,
+                    )
 
     def _update_state(
         self,

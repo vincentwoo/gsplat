@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
+import roma
 import nerfview
 from gsplat.utils import xyz_to_polar
 import numpy as np
@@ -52,15 +53,16 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/whz"
+    #data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
-    #data_dir: str = "/home/paja/data/bike_aliked"
+    data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
+    #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/sutro_hog"
+    result_dir: str = "results/test"
     # Every N images there is a test image
     test_every: int = 10_000
     # Random crop size for training  (experimental)
@@ -140,6 +142,9 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
+    use_global_mlp_refiner: bool = True
+    global_mlp_embed_dim: int = 16
+    global_mlp_hidden_dim: int = 64
     # Enable camera optimization.
     pose_opt: bool = False
     # Learning rate for camera optimization
@@ -159,12 +164,12 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = True
+    use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Exposure
-    use_exposure: bool = True
+    use_exposure_correction: bool = True
     # Exposure learning rate
     exposure_lr: float = 1e-3
 
@@ -199,6 +204,115 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+
+def axis_angle_to_matrix(axis_angle):
+    """
+    Converts an axis-angle rotation of shape [B, 3]
+    into a 3x3 rotation matrix [B, 3, 3].
+    """
+    # length of the axis
+    angle = torch.norm(axis_angle, dim=-1, keepdim=True)
+    axis = axis_angle / (angle + 1e-8)
+    # We can build the rotation via Rodrigues' formula
+    ca = torch.cos(angle)
+    sa = torch.sin(angle)
+    C = 1.0 - ca
+    x, y, z = axis.unbind(-1)
+    # 3x3 rotation per batch
+    R = torch.stack([
+        ca + x * x * C, x * y * C - z * sa, x * z * C + y * sa,
+        y * x * C + z * sa, ca + y * y * C, y * z * C - x * sa,
+        z * x * C - y * sa, z * y * C + x * sa, ca + z * z * C
+    ], dim=-1).reshape(-1, 3, 3)
+    return R
+
+
+class GlobalPoseRefinerMLP(torch.nn.Module):
+    """
+    A hybrid approach that:
+      - Takes per-camera embeddings
+      - Also takes the flattened 3x4 camera pose as input.
+      - Produces a small 6D delta (3 for translation + 3 for axis-angle).
+      - Composes that delta onto the base pose, with an optional weighting factor.
+      - Enforces orthonormal rotation at the end.
+    """
+    def __init__(self,
+                 num_cameras: int,
+                 embed_dim: int = 16,
+                 hidden_dim: int = 64,
+                 update_weight: float = 1.0,
+                 orthonormalize: bool = True):
+        super().__init__()
+
+        self.orthonormalize = orthonormalize
+        self.update_weight = update_weight
+
+        # Per-camera embedding
+        self.embeds = torch.nn.Embedding(num_cameras, embed_dim)
+
+        # We'll feed (flattened base pose = 3x4=12) + embed_dim into the MLP
+        input_dim = 12 + embed_dim
+
+        # A small MLP that outputs a 6D pose update:
+        #   - (tx, ty, tz) in world units
+        #   - (rx, ry, rz) in axis-angle
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, 6),
+        )
+
+        # Initialize final layer so the initial corrections are near zero
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
+
+    def forward(self, base_camtoworlds: torch.Tensor, camera_ids: torch.Tensor):
+        """
+        Args:
+            base_camtoworlds: [B, 4, 4] camera-to-world matrices before refinement
+            camera_ids:       [B] which camera each row corresponds to
+        Returns:
+            refined_camtoworlds: [B, 4, 4]
+        """
+        B = base_camtoworlds.shape[0]
+
+        # Flatten the top-left 3x4 of the base pose => shape [B, 12]
+        base_3x4 = base_camtoworlds[:, 0:3, :].reshape(B, 12)
+
+        # Grab the per-camera embedding => shape [B, embed_dim]
+        z = self.embeds(camera_ids)
+
+        # Concat flattened pose + embedding => shape [B, 12 + embed_dim]
+        net_input = torch.cat([base_3x4, z], dim=-1)
+
+        # MLP => 6D (translation + axis-angle)
+        delta = self.mlp(net_input)   # shape [B, 6]
+        delta_t = delta[:, 0:3]       # shape [B, 3]
+        delta_r = delta[:, 3:6]       # shape [B, 3]
+
+        # Compose onto the base
+        R_base = base_camtoworlds[:, 0:3, 0:3]
+        t_base = base_camtoworlds[:, 0:3, 3]
+
+        # Convert axis-angle => rotation matrix
+        R_delta = axis_angle_to_matrix(delta_r)
+
+        # Weighted
+        R_refined = torch.bmm(R_base, R_delta)        # [B, 3, 3]
+        t_refined = t_base + self.update_weight * delta_t  # [B, 3]
+
+        R_refined = roma.special_procrustes(R_refined)
+
+        refined = base_camtoworlds.clone()
+        refined[:, 0:3, 0:3] = R_refined
+        refined[:, 0:3, 3]   = t_refined
+
+        return refined
+
 
 class ExposureModule(torch.nn.Module):
     def __init__(self, num_images):
@@ -489,7 +603,7 @@ class Runner:
             ]
 
         self.exposure_optimizers = []
-        if cfg.use_exposure:
+        if cfg.use_exposure_correction:
             # Wrap the exposure parameter in a module
             self.exposure_module = ExposureModule(len(self.trainset.indices)).to(self.device)
 
@@ -502,6 +616,27 @@ class Runner:
             ]
             if world_size > 1:
                 self.exposure_module = DDP(self.exposure_module)
+
+        self.pose_refiner_optimizers = []
+        if cfg.use_global_mlp_refiner:
+            self.pose_refiner = GlobalPoseRefinerMLP(
+                num_cameras=len(self.trainset),
+                embed_dim=cfg.global_mlp_embed_dim,
+                hidden_dim=cfg.global_mlp_hidden_dim,
+                update_weight=0.2,
+                orthonormalize=True
+            ).to(self.device)
+            self.pose_refiner_optimizers = [
+                torch.optim.Adam(
+                self.pose_refiner.parameters(),
+                lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
+                weight_decay=cfg.pose_opt_reg,
+                )
+            ]
+
+            if self.world_size > 1:
+                # wrap in DDP if distributed
+                self.pose_refiner = DDP(self.pose_refiner, device_ids=[local_rank])
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -583,7 +718,7 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
-        if self.cfg.use_exposure and image_ids is not None:
+        if self.cfg.use_exposure_correction and image_ids is not None:
             render_colors = self.exposure_module(render_colors, image_ids)
         return render_colors, render_alphas, info
 
@@ -617,6 +752,13 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        #if cfg.use_global_mlp_refiner:
+        #    # pose optimization has a learning rate schedule
+        #    schedulers.append(
+        #        torch.optim.lr_scheduler.ExponentialLR(
+        #            self.pose_refiner_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+        #        )
+        #    )
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -633,7 +775,7 @@ class Runner:
                     ]
                 )
             )
-        if cfg.use_exposure:
+        if cfg.use_exposure_correction:
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.exposure_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
@@ -693,6 +835,8 @@ class Runner:
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
+            if cfg.use_global_mlp_refiner:
+                camtoworlds = self.pose_refiner(camtoworlds, image_ids)
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
@@ -904,6 +1048,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.exposure_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.pose_refiner_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:

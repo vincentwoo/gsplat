@@ -11,6 +11,7 @@ imageio[ffmpeg]
 numpy<2.0.0
 scikit-learn
 tqdm
+roma
 torchmetrics[image]
 opencv-python
 tyro>=0.8.8
