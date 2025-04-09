@@ -85,6 +85,7 @@ class DefaultStrategy(Strategy):
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
     refine_stop_iter: int = 55_000
+    max_budget: int = 4_000_000 # set -1 to disable.
     reset_every: int = 6000
     refine_every: int = 200
     pause_refine_after_reset: int = 0
@@ -215,13 +216,12 @@ class DefaultStrategy(Strategy):
                 self.prune_mask(params, optimizers, state, mask)
 
             print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
-            if step < self.refine_stop_iter / 3:
-                reset_opa(
-                        params=params,
-                        optimizers=optimizers,
-                        state=state,
-                        value=self.prune_opa * 2.0,
-                    )
+            #reset_opa(
+            #        params=params,
+            #        optimizers=optimizers,
+            #        state=state,
+            #        value=self.prune_opa * 2.0,
+            #    )
 
     def _update_state(
         self,
@@ -254,7 +254,7 @@ class DefaultStrategy(Strategy):
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-            self.p_init = min(5 * n_gaussian, 2_000_000)
+            self.p_init = min(5 * n_gaussian, 4_000_000)
             self.last_p_fin = self.p_init
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
@@ -301,6 +301,9 @@ class DefaultStrategy(Strategy):
         deciding how many duplications vs. splits can happen, based on largest
         gradient norms first.
         """
+        if params["means"].shape[0] >= self.max_budget and self.max_budget != -1:
+            return 0, 0  # No more GSs to grow.
+
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device

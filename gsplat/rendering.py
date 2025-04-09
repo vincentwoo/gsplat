@@ -27,6 +27,7 @@ from .utils import depth_to_normal, get_projection_matrix
 
 def rasterization(
     means: Tensor,  # [N, 3]
+    scene_scale: float,
     quats: Tensor,  # [N, 4]
     scales: Tensor,  # [N, 3]
     opacities: Tensor,  # [N]
@@ -527,6 +528,7 @@ def rasterization(
     )
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
+    depths = depths / scene_scale
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk

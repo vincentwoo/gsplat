@@ -549,21 +549,21 @@ class Parser:
             self.mask_dict[camera_id] = mask
 
         # size of the scene measured by cameras
-        camera_locations = camtoworlds[:, :3, 3]
-        scene_center = np.median(camera_locations, axis=0)
-        dists = np.linalg.norm(self.points - scene_center, axis=1)
-        scene_scale = np.median(dists)
-        mad = np.median(np.abs(dists - scene_scale))
-        k = 3
-        threshold = scene_scale + k * mad
-        mask = dists < threshold
-        self.points = self.points[mask]
-        self.points_rgb = self.points_rgb[mask]
+        #camera_locations = camtoworlds[:, :3, 3]
+        #scene_center = np.median(camera_locations, axis=0)
+        #dists = np.linalg.norm(self.points - scene_center, axis=1)
+        #scene_scale = np.median(dists)
+        #mad = np.median(np.abs(dists - scene_scale))
+        #k = 3
+        #threshold = scene_scale + k * mad
+        #mask = dists < threshold
+        #self.points = self.points[mask]
+        #self.points_rgb = self.points_rgb[mask]
 
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(self.points - scene_center, axis=1)
-        self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
+        self.scene_scale = np.median(dists)
 
         XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
         self.schedule = allocate_iterations_by_frequency(total_iterations, XF_full, down_list)

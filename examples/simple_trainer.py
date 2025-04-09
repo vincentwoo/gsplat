@@ -59,7 +59,8 @@ class Config:
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
-    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
+    data_dir: str = "/media/paja/T7/vincent/natanya"
+    #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -73,7 +74,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # downscale
-    downscale: bool = False
+    downscale: bool = True
     # downscale_init
     downscale_init_points: int = 500_000
     # Camera model
@@ -379,10 +380,11 @@ def create_splats_with_optimizers(
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
         if downscale and points.shape[0] > downscale_init_points:
             initial_number = points.shape[0]
-            indices = torch.randperm(points.shape[0])[:downscale_init_points]
+            selection = int(initial_number * 0.5)
+            indices = torch.randperm(points.shape[0])[:selection]
             points = points[indices]
             rgbs = rgbs[indices]
-            print(f"Downsampling from {initial_number} to {downscale_init_points}")
+            print(f"Downsampling from {initial_number} to {selection}")
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -408,8 +410,8 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4),
-        ("w", torch.nn.Parameter(w), 0.0002 * scene_scale),
+        ("means", torch.nn.Parameter(points), 1.6e-5),
+        ("w", torch.nn.Parameter(w), 0.0001 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
@@ -696,6 +698,7 @@ class Runner:
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         render_colors, render_alphas, info = rasterization(
             means=means,
+            scene_scale=self.scene_scale,
             quats=quats,
             scales=scales,
             opacities=opacities,
