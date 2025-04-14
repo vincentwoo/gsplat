@@ -85,7 +85,7 @@ class DefaultStrategy(Strategy):
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
     refine_stop_iter: int = 55_000
-    max_budget: int = 4_000_000 # set -1 to disable.
+    max_budget: int = 5_000_000 # set -1 to disable.
     reset_every: int = 6000
     refine_every: int = 200
     pause_refine_after_reset: int = 0
@@ -176,20 +176,13 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
-            # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                    f"Now having {len(params['means'])} GSs."
-                )
-
             # prune GSs
             n_prune = self._prune_gs(params, optimizers, state, step)
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
             if self.verbose:
+                total_growth = n_dupli + n_split - n_prune
                 print(
-                    f"Step {step}: {n_prune} GSs pruned. "
-                    f"Now having {len(params['means'])} GSs."
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} pruned. Total growth {total_growth}"
                 )
 
             # reset running stats
@@ -254,7 +247,7 @@ class DefaultStrategy(Strategy):
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-            self.p_init = min(5 * n_gaussian, 4_000_000)
+            self.p_init = min(5 * n_gaussian, 5_000_000)
             self.last_p_fin = self.p_init
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)

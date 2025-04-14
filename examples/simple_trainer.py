@@ -74,7 +74,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # downscale
-    downscale: bool = True
+    downscale: bool = False
     # downscale_init
     downscale_init_points: int = 500_000
     # Camera model
@@ -93,7 +93,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 11_000, 15_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000, 60_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 100_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
@@ -171,7 +171,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Exposure
-    use_exposure_correction: bool = True
+    use_exposure_correction: bool = False
     # Exposure learning rate
     exposure_lr: float = 1e-3
 
@@ -436,7 +436,6 @@ def create_splats_with_optimizers(
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
     BS = batch_size * world_size
-    optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
     elif visible_adam:
