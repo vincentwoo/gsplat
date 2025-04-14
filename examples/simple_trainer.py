@@ -53,20 +53,20 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/whz"
+    #data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
     #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
-    #data_dir: str = "/media/paja/T7/vincent/natanya"
+    data_dir: str = "/media/paja/T7/vincent/natanya"
     #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/test"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 10_000
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -144,7 +144,7 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    use_global_mlp_refiner: bool = False
+    use_global_mlp_refiner: bool = True
     global_mlp_embed_dim: int = 16
     global_mlp_hidden_dim: int = 64
     # Enable camera optimization.
@@ -1067,7 +1067,6 @@ class Runner:
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
-                    lr=schedulers[0].get_last_lr()[0],
                     factor=down_factor ** (2.0 - step / max_steps),
                     info=info,
                     packed=cfg.packed,

@@ -529,7 +529,8 @@ def inject_noise_to_position(
 
     Procedure:
       1) Convert means to Cartesian => cart = means / exp(w).
-      2) Compute a noise offset in that local tangent space.
+      2) Compute a noise offset in that local tangent space. We can still
+         scale noise by the covariance from quat & scale, but that is up to you.
       3) cart_new = cart + noise
       4) Convert cart_new => new radius => means/w.
 

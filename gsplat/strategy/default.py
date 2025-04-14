@@ -2,11 +2,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
 import torch
-import math
 from typing_extensions import Literal
 
 from .base import Strategy
-from .ops import duplicate, remove, inject_noise_to_position, split
+from .ops import duplicate, remove, reset_opa, split
 
 
 @dataclass
@@ -81,7 +80,6 @@ class DefaultStrategy(Strategy):
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
-    noise_lr: float = 5e4
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
@@ -162,7 +160,6 @@ class DefaultStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
-        lr: float,
         step: int,
         factor: float,
         info: Dict[str, Any],
@@ -173,27 +170,19 @@ class DefaultStrategy(Strategy):
             return
 
         self._update_state(params, state, info, packed=packed)
-        inject_noise_to_position(
-            params=params,
-            optimizers=optimizers,
-            state=state,
-            scaler=lr * self.noise_lr,
-        )
 
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
-            if params["means"].shape[0] >= self.max_budget and self.max_budget != -1:
-                pass
-            else:
-                n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
-                if self.verbose:
-                    print(
-                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                        f"Now having {len(params['means'])} GSs."
-                    )
+            # grow GSs
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                    f"Now having {len(params['means'])} GSs."
+                )
 
             # prune GSs
             n_prune = self._prune_gs(params, optimizers, state, step)
@@ -312,6 +301,9 @@ class DefaultStrategy(Strategy):
         deciding how many duplications vs. splits can happen, based on largest
         gradient norms first.
         """
+        if params["means"].shape[0] >= self.max_budget and self.max_budget != -1:
+            return 0, 0  # No more GSs to grow.
+
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
