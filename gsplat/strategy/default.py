@@ -196,19 +196,7 @@ class DefaultStrategy(Strategy):
                     )
 
             # prune GSs
-            opacities = torch.sigmoid(params["opacities"].detach())
-
-            # Compute the quantile threshold in logit space
-            threshold = torch.quantile(opacities, 2.0 * self.prune_opa)
-
-            # Mask for pruning in logit space
-            mask = opacities < threshold
-            n_prune = mask.sum().item()
-
-            # Prune
-            if n_prune > 0:
-                self.prune_mask(params, optimizers, state, mask)
-
+            n_prune = self._prune_gs(params, optimizers, state, step)
             if self.verbose:
                 print(
                     f"Step {step}: {n_prune} GSs pruned. "
@@ -222,6 +210,29 @@ class DefaultStrategy(Strategy):
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
             torch.cuda.empty_cache()
+
+        if step % self.reset_every == 0 and self.refine_start_iter <= step < self.refine_stop_iter:
+            # Apply logit to current opacities
+            opacities = torch.sigmoid(params["opacities"].detach())
+
+            # Compute the quantile threshold in logit space
+            threshold = torch.quantile(opacities, 2.0 * self.prune_opa)
+
+            # Mask for pruning in logit space
+            mask = opacities < threshold
+            n_prune = mask.sum().item()
+
+            # Prune
+            if n_prune > 0:
+                self.prune_mask(params, optimizers, state, mask)
+
+            print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
+            #reset_opa(
+            #        params=params,
+            #        optimizers=optimizers,
+            #        state=state,
+            #        value=self.prune_opa * 2.0,
+            #    )
 
     def _update_state(
         self,
