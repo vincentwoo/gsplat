@@ -59,8 +59,8 @@ class Config:
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
-    data_dir: str = "/media/paja/T7/vincent/natanya"
-    #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
+    #data_dir: str = "/media/paja/T7/vincent/natanya"
+    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -132,7 +132,7 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
-    visible_adam: bool = False
+    visible_adam: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = True
 
@@ -166,7 +166,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -679,7 +679,7 @@ class Runner:
         w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
         means = self.splats["means"] * w_inv  # [N, 3]
         quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"]) * w_inv * torch.norm(self.splats["means"], dim=1).unsqueeze(1)
+        scales = torch.exp(self.splats["scales"]) * w_inv
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)

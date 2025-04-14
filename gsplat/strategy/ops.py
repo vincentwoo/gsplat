@@ -167,8 +167,7 @@ def split(
     mother_means = params["means"][sel]  # shape [N_sel, 3]
     # scales = exp(params["scales"]) * w_inv * ||means||
     # the old code does this:
-    r_means = torch.norm(mother_means, dim=1).unsqueeze(1)  # shape [N_sel, 1]
-    mother_scales = torch.exp(params["scales"][sel]) * w_inv * r_means
+    mother_scales = torch.exp(params["scales"][sel]) * w_inv
     # Rotation from quats:
     mother_quats = F.normalize(params["quats"][sel], dim=-1)  # shape [N_sel, 4]
     rotmats = normalized_quat_to_rotmat(mother_quats)  # shape [N_sel, 3,3]

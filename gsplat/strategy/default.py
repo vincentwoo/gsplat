@@ -299,11 +299,8 @@ class DefaultStrategy(Strategy):
         """
         A version of `_grow_gs` that implements a *budgeted* approach for
         deciding how many duplications vs. splits can happen, based on largest
-        gradient norms first.
+        gradient norms first. Optimized for performance.
         """
-        if params["means"].shape[0] >= self.max_budget and self.max_budget != -1:
-            return 0, 0  # No more GSs to grow.
-
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
@@ -311,104 +308,107 @@ class DefaultStrategy(Strategy):
         # Identify the typical thresholds/flags, same as before:
         is_grad_high = grads > self.grow_grad2d
 
+        # Calculate scales in one operation to avoid redundant computations
         w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
-        scales = torch.exp(params["scales"]) * w_inv * torch.norm(params["means"], dim=1).unsqueeze(1)
-        is_small = (
-                scales.max(dim=-1).values
-                <= self.grow_scale3d * state["scene_scale"]
-        )
-        # "Large" => splitting candidate
+        means_norm = torch.norm(params["means"], dim=1, keepdim=True)
+        scales = torch.exp(params["scales"]) * w_inv * means_norm
+        max_scales = scales.max(dim=-1).values
+        is_small = max_scales <= self.grow_scale3d * state["scene_scale"]
         is_large = ~is_small
 
-        # initial masks for duplication vs split
+        # Create masks for duplication and splitting
         is_dupli = is_grad_high & is_small
         is_split = is_grad_high & is_large
 
-        # If we haven't yet stopped scale2d refining, also force-split those with bigger radii
-        if step < self.refine_scale2d_stop_iter:
-            is_split |= state["radii"] > self.grow_scale2d
-
-        # Combine them to get "candidate_mask" for ANY type of growth
+        # Calculate costs for each point (2 for split, 1 for duplication)
+        # This allows us to prioritize by gradient magnitude while accounting for different costs
         candidate_mask = is_dupli | is_split
-        candidate_idxs = candidate_mask.nonzero(as_tuple=False).flatten()
 
-        if candidate_idxs.numel() == 0:
+        # Quick exit if no candidates
+        n_candidates = candidate_mask.sum().item()
+        if n_candidates == 0:
             return 0, 0  # no candidates => nothing to do
 
-        # Sort candidates by descending gradient magnitude
-        candidate_norms = grads[candidate_idxs]
-        sorted_norms, sorted_rel_idx = torch.sort(candidate_norms, descending=True)
-        sorted_candidate_idxs = candidate_idxs[sorted_rel_idx]
-
-        # ------------------------------------------------------------------------
-        #  BUDGET LOGIC
-        # ------------------------------------------------------------------------
-        p_fin = max(self.last_p_fin, 0.98 * self.last_p_fin + candidate_idxs.numel())
+        # Compute total budget
+        p_fin = max(self.last_p_fin, 0.98 * self.last_p_fin + n_candidates)
         self.last_p_fin = p_fin
-        # (Your factor, p_init, etc. come from your original approach)
-        current_count = params["means"].shape[0]  # e.g. how many GS we have
-        budget_left = (self.p_init + (p_fin - self.p_init) / factor) - current_count
+        current_count = params["means"].shape[0]
+        budget_left = int((self.p_init + (p_fin - self.p_init) / factor) - current_count)
 
-        split_cost = 2
-        clone_cost = 1
+        # Quick exit if no budget
+        if budget_left <= 0:
+            return 0, 0
 
-        # We'll figure out which indices we choose to dupli vs. split
-        chosen_dupli = []
-        chosen_split = []
+        # Prepare costs - 2 for split, 1 for duplication
+        candidate_idxs = candidate_mask.nonzero(as_tuple=True)[0]
+        costs = torch.ones_like(candidate_idxs, dtype=torch.int)
+        costs[is_split[candidate_idxs]] = 2
 
-        for idx in sorted_candidate_idxs:
-            if is_split[idx]:
-                cost = split_cost
-            else:
-                cost = clone_cost
+        # Get the gradient values for these candidates
+        candidate_grads = grads[candidate_idxs]
 
-            # If we still have enough budget, choose this idx for that operation
-            if budget_left >= cost:
-                if is_split[idx]:
-                    chosen_split.append(idx.item())
-                else:
-                    chosen_dupli.append(idx.item())
-                budget_left -= cost
-            else:
-                # no more budget => break from loop
-                break
+        # If budget is very limited compared to candidates, use topk instead of full sort
+        # This is faster when we have many candidates but limited budget
+        if budget_left * 3 < n_candidates:  # Heuristic: if budget can handle less than 1/3 of candidates
+            k = min(n_candidates, budget_left * 3)
+            _, top_indices = torch.topk(candidate_grads, k=k, largest=True)
+            sorted_candidate_idxs = candidate_idxs[top_indices]
+            sorted_costs = costs[top_indices]
+        else:
+            # If we might use most candidates, do a full sort
+            _, sort_indices = torch.sort(candidate_grads, descending=True)
+            sorted_candidate_idxs = candidate_idxs[sort_indices]
+            sorted_costs = costs[sort_indices]
 
-        n_dupli = len(chosen_dupli)
-        n_split = len(chosen_split)
+        # Select candidates within budget - greedy approach
+        cum_costs = torch.cumsum(sorted_costs, dim=0)
+        valid_mask = cum_costs <= budget_left
+
+        # If no valid candidates due to budget constraints
+        if not valid_mask.any():
+            # If we can't even afford the first item
+            return 0, 0
+
+        # Get the indices we can afford
+        affordable_indices = sorted_candidate_idxs[valid_mask]
+
+        # Separate into duplication and split operations
+        dupli_indices = affordable_indices[~is_split[affordable_indices]]
+        split_indices = affordable_indices[is_split[affordable_indices]]
+
+        n_dupli = len(dupli_indices)
+        n_split = len(split_indices)
 
         if n_dupli == 0 and n_split == 0:
-            return 0, 0  # Not enough budget to do anything.
+            return 0, 0
 
-        # Build final boolean masks from the chosen idx lists
-        final_dupli_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
-        final_split_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        # Create final masks for operations
         if n_dupli > 0:
-            final_dupli_mask[chosen_dupli] = True
-        if n_split > 0:
-            final_split_mask[chosen_split] = True
-
-        if n_dupli > 0:
+            dupli_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+            dupli_mask[dupli_indices] = True
             duplicate(
                 params=params,
                 optimizers=optimizers,
                 state=state,
-                mask=final_dupli_mask,
+                mask=dupli_mask,
             )
 
-        # Newly duplicated points are appended at the end, so we need to extend
-        # final_split_mask with zeros for the new rows added by duplication:
-        if n_dupli > 0:
-            final_split_mask = torch.cat([
-                final_split_mask,
-                torch.zeros(n_dupli, dtype=torch.bool, device=device)
-            ], dim=0)
-
         if n_split > 0:
+            split_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+            split_mask[split_indices] = True
+
+            # Extend mask if needed after duplication
+            if n_dupli > 0:
+                split_mask = torch.cat([
+                    split_mask,
+                    torch.zeros(n_dupli, dtype=torch.bool, device=device)
+                ], dim=0)
+
             split(
                 params=params,
                 optimizers=optimizers,
                 state=state,
-                mask=final_split_mask,
+                mask=split_mask,
                 revised_opacity=self.revised_opacity,
                 alpha_t=self.alpha_t,
                 alpha_g=self.alpha_g,
@@ -434,23 +434,6 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
-        #if step > self.reset_every:
-        #    w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
-        #    scales = torch.exp(params["scales"]) * w_inv * torch.norm(params["means"], dim=1).unsqueeze(1)
-        #    is_too_big = (
-        #            scales.max(dim=-1).values
-        #            > self.prune_scale3d * state["scene_scale"]
-        #    )
-        #    # The official code also implements sreen-size pruning but
-        #    # it's actually not being used due to a bug:
-        #    # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
-        #    # We implement it here for completeness but set `refine_scale2d_stop_iter`
-        #    # to 0 by default to disable it.
-        #    if step < self.refine_scale2d_stop_iter:
-        #        is_too_big |= state["radii"] > self.prune_scale2d
-
-        #    is_prune = is_prune | is_too_big
-
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
