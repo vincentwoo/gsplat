@@ -57,11 +57,11 @@ class Config:
     #data_dir: str = "/home/paja/data/fasnacht"
     #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
-    #data_dir: str = "/media/paja/T7/vincent/pier90"
+    data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
     #data_dir: str = "/media/paja/T7/vincent/natanya"
-    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
-    # Downsample factor for the dataset
+    #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
+    #Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/test"
@@ -498,6 +498,9 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
+        num_train_imgs = len(self.trainset)
+        self.image_loss_sums = [0.0 for _ in range(num_train_imgs)]
+        self.image_loss_counts = [0 for _ in range(num_train_imgs)]
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -737,10 +740,25 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
+        half_steps = max_steps // 2
         init_step = 0
 
+        uniform_loader = torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+        uniform_iter = iter(uniform_loader)
+
+        # Weighted loader starts as None; we will build it at step >= half_steps
+        weighted_loader = None
+        weighted_iter = None
+
         schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
+            # means has a learning rate schedule, that ends at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
@@ -749,21 +767,12 @@ class Runner:
             ),
         ]
         if cfg.pose_opt:
-            # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
-        #if cfg.use_global_mlp_refiner:
-        #    # pose optimization has a learning rate schedule
-        #    schedulers.append(
-        #        torch.optim.lr_scheduler.ExponentialLR(
-        #            self.pose_refiner_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-        #        )
-        #    )
         if cfg.use_bilateral_grid:
-            # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
                 torch.optim.lr_scheduler.ChainedScheduler(
                     [
@@ -785,22 +794,11 @@ class Runner:
                 )
             )
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
-        trainloader_iter = iter(trainloader)
-
         if "importance" in self.strategy_state and self.strategy_state["importance"] is None:
             self.strategy_state["importance"] = torch.zeros_like(self.splats["opacities"], device=device)
         else:
-            raise
+            raise RuntimeError("Expected self.strategy_state['importance'] to be None initially.")
 
-        # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -811,21 +809,65 @@ class Runner:
                 tic = time.time()
 
             self.trainset.update_step(step)
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+
+            if step < half_steps:
+                # use uniform loader
+                try:
+                    data = next(uniform_iter)
+                except StopIteration:
+                    uniform_iter = iter(uniform_loader)
+                    data = next(uniform_iter)
+            else:
+                if weighted_loader is None:
+                    # Convert lists to torch Tensors
+                    image_loss_sums_t = torch.tensor(self.image_loss_sums, dtype=torch.float32)
+                    image_loss_counts_t = torch.tensor(self.image_loss_counts, dtype=torch.float32)
+
+                    # 1) Compute average loss for each image
+                    avg_loss = image_loss_sums_t / (image_loss_counts_t + 1e-8)
+
+                    # 2) We want images with higher average loss to be sampled more
+                    #    so weight_i = avg_loss[i] / sum(avg_loss).
+                    total_loss = float(avg_loss.sum())
+                    if total_loss < 1e-8:
+                        # fallback if all zero
+                        weights = torch.ones_like(avg_loss)
+                    else:
+                        weights = avg_loss / total_loss
+
+                    # Build WeightedRandomSampler
+                    sampler = torch.utils.data.WeightedRandomSampler(
+                        weights=weights,
+                        num_samples=len(self.trainset),
+                        replacement=True
+                    )
+                    weighted_loader = torch.utils.data.DataLoader(
+                        self.trainset,
+                        batch_size=cfg.batch_size,
+                        sampler=sampler,
+                        num_workers=4,
+                        persistent_workers=True,
+                        pin_memory=True,
+                    )
+                    weighted_iter = iter(weighted_loader)
+
+                # Actually get batch from weighted loader
+                try:
+                    data = next(weighted_iter)
+                except StopIteration:
+                    weighted_iter = iter(weighted_loader)
+                    data = next(weighted_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             down_factor = data["down_factor"]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+                    pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
+            image_ids = data["image_id"].to(device)  # shape [B], each is an index in [0..len(trainset)]
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -834,12 +876,11 @@ class Runner:
 
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
-
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
-
             if cfg.use_global_mlp_refiner:
                 camtoworlds = self.pose_refiner(camtoworlds, image_ids)
+
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
@@ -865,8 +906,8 @@ class Runner:
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    (torch.arange(height, device=device) + 0.5) / height,
+                    (torch.arange(width, device=device) + 0.5) / width,
                     indexing="ij",
                 )
                 grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
@@ -940,14 +981,11 @@ class Runner:
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
+            loss_val = loss.detach().item()
+            for idx in image_ids:
+                idx_cpu = idx.item()
+                self.image_loss_sums[idx_cpu] += loss_val
+                self.image_loss_counts[idx_cpu] += 1
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1027,11 +1065,8 @@ class Runner:
                     )
 
             if cfg.visible_adam:
-                gaussian_cnt = self.splats.means.shape[0]
                 if cfg.packed:
-                    visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
-                    )
+                    visibility_mask = torch.zeros_like(self.splats["opacities"], dtype=bool)
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
                     visibility_mask = importance > 0
@@ -1095,9 +1130,6 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                #self.render_traj(step)
-
-            # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
 
