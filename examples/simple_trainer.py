@@ -171,7 +171,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Exposure
-    use_exposure_correction: bool = False
+    use_exposure_correction: bool = True
     # Exposure learning rate
     exposure_lr: float = 1e-3
 

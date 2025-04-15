@@ -96,7 +96,7 @@ class DefaultStrategy(Strategy):
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     p_init: int = 0
-    last_p_fin: int = 0
+    p_fin: int = 0
     alpha_t: float = 1.0
     alpha_g: float = 0.2
     binoms: Optional[torch.Tensor] = None
@@ -259,8 +259,8 @@ class DefaultStrategy(Strategy):
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-            self.p_init = min(5 * n_gaussian, 4_000_000)
-            self.last_p_fin = self.p_init
+            self.p_init = params["means"].shape[0]
+            self.p_fin = min(self.max_budget, 5 * self.p_init)
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
@@ -336,10 +336,9 @@ class DefaultStrategy(Strategy):
             return 0, 0  # no candidates => nothing to do
 
         # Compute total budget
-        p_fin = max(self.last_p_fin, 0.98 * self.last_p_fin + n_candidates)
-        self.last_p_fin = p_fin
+        self.p_fin = max(self.p_fin, 0.98 * self.p_fin + n_candidates)
         current_count = params["means"].shape[0]
-        budget_left = int((self.p_init + (p_fin - self.p_init) / factor) - current_count)
+        budget_left = int((self.p_init + (self.p_fin - self.p_init) / factor) - current_count)
 
         # Quick exit if no budget
         if budget_left <= 0:
