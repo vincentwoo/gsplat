@@ -1,11 +1,12 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Tuple, Union, Optional
 
 import torch
+import math
 from typing_extensions import Literal
 
 from .base import Strategy
-from .ops import duplicate, remove, reset_opa, split
+from .ops import duplicate, remove, relocate, split, inject_noise_to_position
 
 
 @dataclass
@@ -81,11 +82,12 @@ class DefaultStrategy(Strategy):
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
+    noise_lr: float = 5e5
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
     refine_stop_iter: int = 55_000
-    max_budget: int = 5_000_000 # set -1 to disable.
+    max_budget: int = 4_000_000 # set -1 to disable.
     reset_every: int = 6000
     refine_every: int = 200
     pause_refine_after_reset: int = 0
@@ -97,6 +99,7 @@ class DefaultStrategy(Strategy):
     last_p_fin: int = 0
     alpha_t: float = 1.0
     alpha_g: float = 0.2
+    binoms: Optional[torch.Tensor] = None
 
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -162,6 +165,7 @@ class DefaultStrategy(Strategy):
         state: Dict[str, Any],
         step: int,
         factor: float,
+        lr: float,
         info: Dict[str, Any],
         packed: bool = False,
     ):
@@ -169,20 +173,37 @@ class DefaultStrategy(Strategy):
         if step >= self.refine_stop_iter:
             return
 
+        if self.binoms is None:
+            n_max = 51
+            self.binoms = torch.zeros((n_max, n_max))
+            for n in range(n_max):
+                for k in range(n + 1):
+                    self.binoms[n, k] = math.comb(n, k)
+
+            self.binoms = self.binoms.to(params["means"].device)
+
         self._update_state(params, state, info, packed=packed)
+
+        if (self.refine_start_iter < step < self.refine_stop_iter):
+            inject_noise_to_position(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                scaler=lr * self.noise_lr,
+            )
 
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
-            # prune GSs
             n_prune = self._prune_gs(params, optimizers, state, step)
+            n_relocated_gs = self._relocate_gs(params, optimizers, n_prune, self.binoms)
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
             if self.verbose:
-                total_growth = n_dupli + n_split - n_prune
+                total_growth = n_dupli + n_split
                 print(
-                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} pruned. Total growth {total_growth}"
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} pruned, {n_relocated_gs} relocated. Total growth {total_growth}"
                 )
 
             # reset running stats
@@ -195,26 +216,17 @@ class DefaultStrategy(Strategy):
 
         if step % self.reset_every == 0 and self.refine_start_iter <= step < self.refine_stop_iter:
             # Apply logit to current opacities
-            opacities = torch.sigmoid(params["opacities"].detach())
-
-            # Compute the quantile threshold in logit space
-            threshold = torch.quantile(opacities, 2.0 * self.prune_opa)
-
             # Mask for pruning in logit space
-            mask = opacities < threshold
+            threshold = 2.0 * self.prune_opa
+            mask = state["importance"] < threshold
             n_prune = mask.sum().item()
 
             # Prune
             if n_prune > 0:
                 self.prune_mask(params, optimizers, state, mask)
 
+            state["importance"].zero_()
             print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
-            #reset_opa(
-            #        params=params,
-            #        optimizers=optimizers,
-            #        state=state,
-            #        value=self.prune_opa * 2.0,
-            #    )
 
     def _update_state(
         self,
@@ -247,7 +259,7 @@ class DefaultStrategy(Strategy):
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-            self.p_init = min(5 * n_gaussian, 5_000_000)
+            self.p_init = min(5 * n_gaussian, 4_000_000)
             self.last_p_fin = self.p_init
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
@@ -294,6 +306,8 @@ class DefaultStrategy(Strategy):
         deciding how many duplications vs. splits can happen, based on largest
         gradient norms first. Optimized for performance.
         """
+        if params["means"].shape[0] >= self.max_budget and self.max_budget != -1:
+            return 0, 0
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
@@ -432,3 +446,32 @@ class DefaultStrategy(Strategy):
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
         return n_prune
+
+    @torch.no_grad()
+    def _relocate_gs(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        N: int,
+        binoms: torch.Tensor,
+    ) -> int:
+        opacities = torch.sigmoid(params["opacities"].flatten())
+        sorted_indices = torch.argsort(opacities)
+        dead_indices = sorted_indices[:N]
+        dead_mask = torch.zeros_like(opacities, dtype=torch.bool)
+        dead_mask[dead_indices] = True
+        n_gs = dead_mask.sum().item()
+
+        if n_gs > 0:
+            min_opacity = opacities[dead_indices].max().item()
+
+            relocate(
+                params=params,
+                optimizers=optimizers,
+                state={},
+                mask=dead_mask,
+                binoms=binoms,
+                min_opacity=min_opacity,
+            )
+
+        return n_gs

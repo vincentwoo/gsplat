@@ -74,7 +74,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # downscale
-    downscale: bool = False
+    downscale: bool = True
     # downscale_init
     downscale_init_points: int = 500_000
     # Camera model
@@ -844,6 +844,7 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
+            importance = torch.zeros_like(self.splats["opacities"], device=device)
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -854,6 +855,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                importance=importance,
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -1032,8 +1034,9 @@ class Runner:
                     )
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
-                    visibility_mask = (info["radii"] > 0).all(-1).any(0)
+                    visibility_mask = importance > 0
 
+            self.strategy_state["importance"] = torch.max(self.strategy_state["importance"], importance)
             # optimize
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
@@ -1068,6 +1071,7 @@ class Runner:
                     step=step,
                     factor=down_factor ** (2.0 - step / max_steps),
                     info=info,
+                    lr=schedulers[0].get_last_lr()[0],
                     packed=cfg.packed,
                 )
                 if step == self.cfg.strategy.refine_stop_iter:
