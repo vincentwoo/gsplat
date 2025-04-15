@@ -317,8 +317,7 @@ class DefaultStrategy(Strategy):
 
         # Calculate scales in one operation to avoid redundant computations
         w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
-        means_norm = torch.norm(params["means"], dim=1, keepdim=True)
-        scales = torch.exp(params["scales"]) * w_inv * means_norm
+        scales = torch.exp(params["scales"]) * w_inv
         max_scales = scales.max(dim=-1).values
         is_small = max_scales <= self.grow_scale3d * state["scene_scale"]
         is_large = ~is_small
