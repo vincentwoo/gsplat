@@ -57,10 +57,10 @@ class Config:
     #data_dir: str = "/home/paja/data/fasnacht"
     #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
-    data_dir: str = "/media/paja/T7/vincent/pier90"
+    #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
     #data_dir: str = "/media/paja/T7/vincent/natanya"
-    #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
+    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     #Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -166,7 +166,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = True
+    use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -410,8 +410,8 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-5),
-        ("w", torch.nn.Parameter(w), 0.0001 * scene_scale),
+        ("means", torch.nn.Parameter(points), 1.6e-6),
+        ("w", torch.nn.Parameter(w), 0.00005 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
@@ -740,7 +740,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        half_steps = max_steps // 2
+        update_steps = [max_steps // 2, (3 * max_steps) // 4]
         init_step = 0
 
         uniform_loader = torch.utils.data.DataLoader(
@@ -763,7 +763,7 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["w"], gamma=0.005 ** (1.0 / max_steps)
+                self.optimizers["w"], gamma=0.1 ** (.5 / max_steps)
             ),
         ]
         if cfg.pose_opt:
@@ -800,6 +800,8 @@ class Runner:
             raise RuntimeError("Expected self.strategy_state['importance'] to be None initially.")
 
         global_tic = time.time()
+
+        current_loader = "uniform"
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -810,48 +812,41 @@ class Runner:
 
             self.trainset.update_step(step)
 
-            if step < half_steps:
-                # use uniform loader
+            if step in update_steps:
+                # Rebuild weighted loader at these steps
+                image_loss_sums_t = torch.tensor(self.image_loss_sums, dtype=torch.float32)
+                image_loss_counts_t = torch.tensor(self.image_loss_counts, dtype=torch.float32)
+                avg_loss = image_loss_sums_t / (image_loss_counts_t + 1e-8)
+                total_loss = float(avg_loss.sum())
+                weights = avg_loss / total_loss if total_loss >= 1e-8 else torch.ones_like(avg_loss)
+
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=weights,
+                    num_samples=len(self.trainset),
+                    replacement=True
+                )
+                weighted_loader = torch.utils.data.DataLoader(
+                    self.trainset,
+                    batch_size=cfg.batch_size,
+                    sampler=sampler,
+                    num_workers=4,
+                    persistent_workers=True,
+                    pin_memory=True,
+                )
+                weighted_iter = iter(weighted_loader)
+                current_loader = "weighted"
+
+                num_train_imgs = len(self.trainset)
+                self.image_loss_sums = [0.0] * num_train_imgs
+                self.image_loss_counts = [0] * num_train_imgs
+                # Select the loader based on current_loader
+            if current_loader == "uniform":
                 try:
                     data = next(uniform_iter)
                 except StopIteration:
                     uniform_iter = iter(uniform_loader)
                     data = next(uniform_iter)
             else:
-                if weighted_loader is None:
-                    # Convert lists to torch Tensors
-                    image_loss_sums_t = torch.tensor(self.image_loss_sums, dtype=torch.float32)
-                    image_loss_counts_t = torch.tensor(self.image_loss_counts, dtype=torch.float32)
-
-                    # 1) Compute average loss for each image
-                    avg_loss = image_loss_sums_t / (image_loss_counts_t + 1e-8)
-
-                    # 2) We want images with higher average loss to be sampled more
-                    #    so weight_i = avg_loss[i] / sum(avg_loss).
-                    total_loss = float(avg_loss.sum())
-                    if total_loss < 1e-8:
-                        # fallback if all zero
-                        weights = torch.ones_like(avg_loss)
-                    else:
-                        weights = avg_loss / total_loss
-
-                    # Build WeightedRandomSampler
-                    sampler = torch.utils.data.WeightedRandomSampler(
-                        weights=weights,
-                        num_samples=len(self.trainset),
-                        replacement=True
-                    )
-                    weighted_loader = torch.utils.data.DataLoader(
-                        self.trainset,
-                        batch_size=cfg.batch_size,
-                        sampler=sampler,
-                        num_workers=4,
-                        persistent_workers=True,
-                        pin_memory=True,
-                    )
-                    weighted_iter = iter(weighted_loader)
-
-                # Actually get batch from weighted loader
                 try:
                     data = next(weighted_iter)
                 except StopIteration:

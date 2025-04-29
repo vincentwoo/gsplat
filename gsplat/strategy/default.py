@@ -97,8 +97,6 @@ class DefaultStrategy(Strategy):
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     p_init: int = 0
     p_fin: int = 0
-    alpha_t: float = 1.0
-    alpha_g: float = 0.2
     binoms: Optional[torch.Tensor] = None
 
 
@@ -198,10 +196,10 @@ class DefaultStrategy(Strategy):
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
             n_prune = self._prune_gs(params, optimizers, state, step)
-            n_relocated_gs = self._relocate_gs(params, optimizers, n_prune, self.binoms)
+            n_relocated_gs = self._relocate_gs(params, optimizers, state, n_prune, self.binoms)
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
             if self.verbose:
-                total_growth = n_dupli + n_split
+                total_growth = n_dupli + n_split - n_split
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} pruned, {n_relocated_gs} relocated. Total growth {total_growth}"
                 )
@@ -209,7 +207,6 @@ class DefaultStrategy(Strategy):
             # reset running stats
             state["grad2d"].zero_()
             state["count"].zero_()
-            # Note: We don't zero importance!
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
             torch.cuda.empty_cache()
@@ -415,8 +412,6 @@ class DefaultStrategy(Strategy):
                 state=state,
                 mask=split_mask,
                 revised_opacity=self.revised_opacity,
-                alpha_t=self.alpha_t,
-                alpha_g=self.alpha_g,
             )
 
         return n_dupli, n_split
@@ -447,20 +442,30 @@ class DefaultStrategy(Strategy):
 
     @torch.no_grad()
     def _relocate_gs(
-        self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        N: int,
-        binoms: torch.Tensor,
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            N: int,
+            binoms: torch.Tensor,
     ) -> int:
-        opacities = torch.sigmoid(params["opacities"].flatten())
-        sorted_indices = torch.argsort(opacities)
-        dead_indices = sorted_indices[:N]
-        dead_mask = torch.zeros_like(opacities, dtype=torch.bool)
-        dead_mask[dead_indices] = True
-        n_gs = dead_mask.sum().item()
 
-        if n_gs > 0:
+        importance = state["importance"]
+        nonzero_mask = importance > 0
+        nonzero_indices = torch.nonzero(nonzero_mask, as_tuple=True)[0]
+
+        if nonzero_indices.numel() > 0:
+            sorted_nonzero_indices = nonzero_indices[torch.argsort(importance[nonzero_mask])]
+            N = max(N, 2_000)
+            dead_indices = sorted_nonzero_indices[:N]
+
+            opacities = torch.sigmoid(params["opacities"].flatten())
+            dead_mask = torch.zeros_like(opacities, dtype=torch.bool)
+            dead_mask[dead_indices] = True
+        else:
+            dead_mask = torch.zeros_like(params["opacities"].flatten(), dtype=torch.bool)
+
+        if N > 0:
             min_opacity = opacities[dead_indices].max().item()
 
             relocate(
@@ -472,4 +477,4 @@ class DefaultStrategy(Strategy):
                 min_opacity=min_opacity,
             )
 
-        return n_gs
+        return N

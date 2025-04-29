@@ -23,8 +23,7 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
         w = np.exp(w_log).reshape(-1, 1)  # W in linear space
         # Convert homogeneous means -> 3D means in world space
         means_3d = (means / w)
-        norms_means = np.linalg.norm(means, axis=1, keepdims=True)  # (N, 1)
-        scales_3d = np.log(np.exp(scales_log) / w * norms_means)
+        scales_3d = np.log(np.exp(scales_log) / w)
     else:
         # If there's no 'w', we assume 'means' is already standard 3D
         means_3d = means
