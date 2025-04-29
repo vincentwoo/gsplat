@@ -183,15 +183,6 @@ class DefaultStrategy(Strategy):
 
         self._update_state(params, state, info, packed=packed)
 
-        if (self.refine_start_iter < step < self.refine_stop_iter):
-            inject_noise_to_position(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                scaler=lr * self.noise_lr,
-                noise_stepness=self.noise_stepness,
-            )
-
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0
@@ -227,6 +218,16 @@ class DefaultStrategy(Strategy):
 
             state["importance"].zero_()
             print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
+
+        if (self.refine_start_iter < step < self.refine_stop_iter):
+            inject_noise_to_position(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                scaler=lr * self.noise_lr,
+                noise_stepness=self.noise_stepness,
+            )
+
 
     def _update_state(
         self,
