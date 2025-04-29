@@ -33,12 +33,12 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
+from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.utils import save_ply
 
 
 @dataclass
@@ -55,12 +55,12 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     #data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
-    #data_dir: str = "/home/paja/data/bike_aliked"
+    data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
     #data_dir: str = "/media/paja/T7/vincent/sutro"
     #data_dir: str = "/media/paja/T7/vincent/natanya"
-    data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
+    #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     #Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -166,7 +166,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -1030,7 +1030,7 @@ class Runner:
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
-                rgb = None
+
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
                     rgb = self.app_module(
@@ -1040,9 +1040,27 @@ class Runner:
                         sh_degree=sh_degree_to_use,
                     )
                     rgb = rgb + self.splats["colors"]
-                    rgb = torch.sigmoid(rgb).squeeze(0)
+                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+                    sh0 = rgb_to_sh(rgb)
+                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                else:
+                    sh0 = self.splats["sh0"]
+                    shN = self.splats["shN"]
 
-                save_ply(self.splats, f"{self.ply_dir}/point_cloud_{step}.ply", rgb)
+                means = self.splats["means"]
+                scales = self.splats["scales"]
+                quats = self.splats["quats"]
+                opacities = self.splats["opacities"]
+                export_splats(
+                    means=means,
+                    scales=scales,
+                    quats=quats,
+                    opacities=opacities,
+                    sh0=sh0,
+                    shN=shN,
+                    format="ply",
+                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+                )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
