@@ -83,6 +83,7 @@ class DefaultStrategy(Strategy):
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
     noise_lr: float = 5e5
+    noise_stepness: int = 10
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
@@ -188,6 +189,7 @@ class DefaultStrategy(Strategy):
                 optimizers=optimizers,
                 state=state,
                 scaler=lr * self.noise_lr,
+                noise_stepness=self.noise_stepness,
             )
 
         if (

@@ -449,6 +449,7 @@ def inject_noise_to_position(
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
     scaler: float,
+    noise_stepness: int,
 ):
     """Inject noise into the positions, respecting the 'homogeneous' representation.
 
@@ -470,8 +471,7 @@ def inject_noise_to_position(
         scaler: scalar factor for noise amplitude.
     """
 
-    # Slightly sharpened control for how quickly noise goes to 0 as opacity -> 1
-    def op_sigmoid(x, k=100, x0=0.995):
+    def op_sigmoid(x, k=noise_stepness, x0=0.995):
         return 1.0 / (1.0 + torch.exp(-k * (x - x0)))
 
     # Grab the existing data
