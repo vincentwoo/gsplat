@@ -195,11 +195,12 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
-            n_prune = self._prune_gs(params, optimizers, state, step)
+            #n_prune = self._prune_gs(params, optimizers, state, step)
+            n_prune = 0
             n_relocated_gs = self._relocate_gs(params, optimizers, state, n_prune, self.binoms)
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step, factor)
             if self.verbose:
-                total_growth = n_dupli + n_split - n_split
+                total_growth = n_dupli + n_split - n_prune
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} pruned, {n_relocated_gs} relocated. Total growth {total_growth}"
                 )
@@ -449,32 +450,31 @@ class DefaultStrategy(Strategy):
             N: int,
             binoms: torch.Tensor,
     ) -> int:
+        importance: torch.Tensor = state["importance"]
 
-        importance = state["importance"]
-        nonzero_mask = importance > 0
-        nonzero_indices = torch.nonzero(nonzero_mask, as_tuple=True)[0]
+        # Elements eligible for relocation: 0 < importance < self.prune_opa
+        candidate_mask = (importance > 0) & (importance < self.prune_opa)
+        candidate_indices = torch.nonzero(candidate_mask, as_tuple=True)[0]
 
-        if nonzero_indices.numel() > 0:
-            sorted_nonzero_indices = nonzero_indices[torch.argsort(importance[nonzero_mask])]
-            N = max(N, 2_000)
-            dead_indices = sorted_nonzero_indices[:N]
+        if candidate_indices.numel() == 0:
+            return 0
 
-            opacities = torch.sigmoid(params["opacities"].flatten())
-            dead_mask = torch.zeros_like(opacities, dtype=torch.bool)
-            dead_mask[dead_indices] = True
-        else:
-            dead_mask = torch.zeros_like(params["opacities"].flatten(), dtype=torch.bool)
+        # Sort by ascending importance so we relocate the *least* important first
+        sorted_indices = candidate_indices[torch.argsort(importance[candidate_mask])]
 
-        if N > 0:
-            min_opacity = opacities[dead_indices].max().item()
+        opacities = torch.sigmoid(params["opacities"].flatten())
+        dead_mask = torch.zeros_like(opacities, dtype=torch.bool)
+        dead_mask[sorted_indices] = True
 
-            relocate(
-                params=params,
-                optimizers=optimizers,
-                state={},
-                mask=dead_mask,
-                binoms=binoms,
-                min_opacity=min_opacity,
-            )
+        min_opacity = opacities[sorted_indices].max().item()
 
-        return N
+        relocate(
+            params=params,
+            optimizers=optimizers,
+            state={},
+            mask=dead_mask,
+            binoms=binoms,
+            min_opacity=min_opacity,
+        )
+
+        return sorted_indices.numel()
