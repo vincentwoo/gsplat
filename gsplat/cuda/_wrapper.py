@@ -1000,31 +1000,16 @@ class _RasterizeToPixels(torch.autograd.Function):
         else:
             v_backgrounds = None
 
-        import torch
+        scaling_factor = torch.minimum(torch.ones_like(depths), (depths / 0.37) ** 2)
 
-        def make_depth_scaling_poly(depths: torch.Tensor, falloff: float = 3.0) -> torch.Tensor:
-            # coefficients of the original quadratic:  f(x)=ax² + bx + c, x∈[0,1]
-            a, b, c = -4.2, 4.3, 0.9  # f(0)=0.9, f(0.5)=2.0, f(1)=1.0
+        def scale_tensor(tensor, scaling_factor):
+            num_dims = len(tensor.shape)
+            for _ in range(num_dims - 2):
+                scaling_factor = scaling_factor.unsqueeze(-1)
+            scaling_factor_expanded = scaling_factor.expand_as(tensor)
+            return tensor * scaling_factor_expanded
 
-            scale = torch.empty_like(depths)
-
-            # 1) polynomial part:  0 ≤ d ≤ 0.5
-            poly_mask = (depths >= 0) & (depths <= 0.5)
-            x = depths[poly_mask] * 2.0  # map [0,0.5] → [0,1]
-            scale[poly_mask] = (a * x + b) * x + c
-
-            # 2) exponential decay:  d > 0.5
-            exp_mask = depths > 0.5
-            scale[exp_mask] = torch.exp(-falloff * (depths[exp_mask] - 0.5))
-
-            # 3) clamp negative depths
-            neg_mask = depths < 0
-            scale[neg_mask] = c  # = 0.9
-
-            return scale
-
-        scaling_factor = make_depth_scaling_poly(depths, falloff=3.0)
-        scaled_v_means2d = v_means2d * scaling_factor.unsqueeze(-1)
+        scaled_v_means2d = scale_tensor(v_means2d, scaling_factor)
         return (
             scaled_v_means2d,
             v_conics,

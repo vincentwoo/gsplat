@@ -586,6 +586,15 @@ class Parser:
 
         XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
         self.schedule = allocate_iterations_by_frequency(total_iterations, XF_full, down_list)
+        # self.schedule = [(1.0 / 5.0, 4000), (1.0 / 4.0, 4000), (1.0 / 3.0, 8000), (1.0 / 2.0, 12000), (1.0, 92000)]
+        # self.schedule = [(1.0 / 4.0, 4000), (1.0 / 3.0, 8000), (1.0 / 2.0, 8000), (1.0, 100000)]
+        # self.schedule = [
+        #     (1.0 / 5.0, int(0.01 * total_iterations)),
+        #     (1.0 / 4.0, int(0.02 * total_iterations)),
+        #     (1.0 / 3.0, int(0.02 * total_iterations)),
+        #     (1.0 / 2.0, int(0.05 * total_iterations)),
+        #     (1.0,       int(0.90 * total_iterations)),
+        # ]
         print(f"Generated Resolution Schedule (factor, steps): {self.schedule}")
         if sum(s for f, s in self.schedule) != total_iterations:
             print(f"Warning: Schedule steps sum to {sum(s for f, s in self.schedule)}, expected {total_iterations}. Check allocation logic.")
