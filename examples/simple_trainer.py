@@ -144,7 +144,7 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    use_global_mlp_refiner: bool = True
+    use_global_mlp_refiner: bool = False
     global_mlp_embed_dim: int = 16
     global_mlp_hidden_dim: int = 64
     # Enable camera optimization.
@@ -166,7 +166,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = True
+    use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -410,8 +410,8 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-6),
-        ("w", torch.nn.Parameter(w), 0.00005 * scene_scale),
+        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+        ("w", torch.nn.Parameter(w), 0.0002 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
@@ -1438,8 +1438,8 @@ if __name__ == "__main__":
             Config(
                 init_opa=0.5,
                 init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
+                opacity_reg=0.0,
+                scale_reg=0.0,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),

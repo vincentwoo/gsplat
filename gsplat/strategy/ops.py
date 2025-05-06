@@ -47,11 +47,11 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
 
 @torch.no_grad()
 def _update_param_with_optimizer(
-    param_fn: Callable[[str, Tensor], Tensor],
-    optimizer_fn: Callable[[str, Tensor], Tensor],
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    names: Union[List[str], None] = None,
+        param_fn: Callable[[str, Tensor], Tensor],
+        optimizer_fn: Callable[[str, Tensor], Tensor],
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        names: Union[List[str], None] = None,
 ):
     """Update the parameters and the state in the optimizers with defined functions.
 
@@ -92,10 +92,10 @@ def _update_param_with_optimizer(
 
 @torch.no_grad()
 def duplicate(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        mask: Tensor,
 ):
     """Inplace duplicate the Gaussian with the given mask.
 
@@ -123,11 +123,11 @@ def duplicate(
 
 @torch.no_grad()
 def split(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
-    revised_opacity: bool = False,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        mask: Tensor,
+        revised_opacity: bool = False,
 ):
     device = mask.device
     sel = torch.where(mask)[0]   # Indices to split
@@ -264,10 +264,10 @@ def split(
 
 @torch.no_grad()
 def remove(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        mask: Tensor,
 ):
     """Inplace remove the Gaussian with the given mask.
 
@@ -294,10 +294,10 @@ def remove(
 
 @torch.no_grad()
 def reset_opa(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    value: float,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        value: float,
 ):
     """Inplace reset the opacities to the given post-sigmoid value.
 
@@ -325,12 +325,12 @@ def reset_opa(
 
 @torch.no_grad()
 def relocate(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
-    binoms: Tensor,
-    min_opacity: float = 0.005,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        mask: Tensor,
+        binoms: Tensor,
+        min_opacity: float = 0.005,
 ):
     """Inplace relocate some dead Gaussians to the lives ones.
 
@@ -351,11 +351,12 @@ def relocate(
     probs = opacities[alive_indices]
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     sampled_idxs = alive_indices[sampled_idxs]
+    w_inv = 1.0 / torch.exp(params["w"][sampled_idxs]).unsqueeze(1)
 
     # new opacities/scales
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=torch.exp(params["scales"])[sampled_idxs] * w_inv,
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
@@ -366,7 +367,7 @@ def relocate(
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[sampled_idxs] = torch.log(new_scales * torch.exp(params["w"][sampled_idxs]).unsqueeze(1))
         else:
             # e.g. means, w, quats => no "random offset" in relocate;
             # we simply keep them as is or we might do something more advanced.
@@ -397,36 +398,35 @@ def relocate(
 
 @torch.no_grad()
 def sample_add(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    n: int,
-    binoms: Tensor,
-    min_opacity: float = 0.005,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        n: int,
+        binoms: Tensor,
+        min_opacity: float = 0.005,
 ):
     opacities = torch.sigmoid(params["opacities"])
 
     eps = torch.finfo(torch.float32).eps
     probs = opacities.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    w = params["w"][sampled_idxs].exp().unsqueeze(-1)
+    w_inv = 1 / w
 
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=torch.exp(params["scales"])[sampled_idxs] * w_inv,
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
-        # shape: oldN = p.shape[0]
-        # we will append new entries = p[sampled_idxs], possibly with modifications
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[sampled_idxs] = torch.log(new_scales  * w)
         # For means, w, quats, etc., we simply copy from the chosen source.
-        # If you prefer a random offset (like in 'split'), you can do so here.
         p_new = torch.cat([p, p[sampled_idxs]], dim=0)
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
@@ -445,11 +445,11 @@ def sample_add(
 
 @torch.no_grad()
 def inject_noise_to_position(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    scaler: float,
-    noise_stepness: int,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        scaler: float,
+        noise_stepness: int = 100,
 ):
     """Inject noise into the positions, respecting the 'homogeneous' representation.
 
@@ -486,7 +486,7 @@ def inject_noise_to_position(
     # Covariance-based noise scale
     # The function returns (covars, None), where covars is [N,3,3] if triu=False.
     covars, _ = quat_scale_to_covar_preci(
-        params["quats"], scales, compute_covar=True, compute_preci=False, triu=False
+        params["quats"], scales / torch.exp(w_log).unsqueeze(-1), compute_covar=True, compute_preci=False, triu=False
     )
 
     # The factor (op_sigmoid(1 - opacities)) is near 1 for low opacities and near 0 for high.

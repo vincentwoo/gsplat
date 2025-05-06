@@ -48,8 +48,8 @@ class MCMCStrategy(Strategy):
 
     cap_max: int = 1_500_000
     noise_lr: float = 5e5
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 45_000
+    refine_start_iter: int = 1_500
+    refine_stop_iter: int = 55_000
     refine_every: int = 200
     min_opacity: float = 0.005
     verbose: bool = False
@@ -61,7 +61,7 @@ class MCMCStrategy(Strategy):
         for n in range(n_max):
             for k in range(n + 1):
                 binoms[n, k] = math.comb(n, k)
-        return {"binoms": binoms}
+        return {"binoms": binoms, "importance": None}
 
     def check_sanity(
         self,
@@ -130,7 +130,7 @@ class MCMCStrategy(Strategy):
                 print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
 
             # add new GSs
-            n_new_gs = self._add_new_gs(params, optimizers, binoms)
+            n_new_gs = self._add_new_gs(params, optimizers, binoms, state)
             if self.verbose:
                 print(
                     f"Step {step}: Added {n_new_gs} GSs. "
@@ -171,6 +171,7 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        state: Dict[str, Any],
     ) -> int:
         current_n_points = len(params["means"])
         n_target = min(self.cap_max, int(1.05 * current_n_points))
@@ -179,7 +180,7 @@ class MCMCStrategy(Strategy):
             sample_add(
                 params=params,
                 optimizers=optimizers,
-                state={},
+                state=state,
                 n=n_gs,
                 binoms=binoms,
                 min_opacity=self.min_opacity,
