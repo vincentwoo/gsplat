@@ -78,17 +78,17 @@ class DefaultStrategy(Strategy):
     """
 
     prune_opa: float = 0.005
-    grow_grad2d: float = 0.0002
+    grow_grad2d: float = 0.00012
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
     noise_lr: float = 5e5
-    noise_stepness: int = 10
+    noise_stepness: int = 100
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
     refine_stop_iter: int = 55_000
-    max_budget: int = 4_000_000 # set -1 to disable.
+    max_budget: int = 10_000_000 # set -1 to disable.
     reset_every: int = 6000
     refine_every: int = 200
     pause_refine_after_reset: int = 0
@@ -261,7 +261,10 @@ class DefaultStrategy(Strategy):
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
             self.p_init = params["means"].shape[0]
-            self.p_fin = min(self.max_budget, 5 * self.p_init)
+            if self.max_budget > 0:
+                self.p_fin = self.max_budget
+            else:
+                self.p_fin = 5 * self.p_init
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
@@ -337,9 +340,8 @@ class DefaultStrategy(Strategy):
             return 0, 0  # no candidates => nothing to do
 
         # Compute total budget
-        self.p_fin = max(self.p_fin, 0.98 * self.p_fin + n_candidates)
         current_count = params["means"].shape[0]
-        budget_left = int((self.p_init + (self.p_fin - self.p_init) / factor) - current_count)
+        budget_left = int((self.p_init + (self.p_fin - self.p_init) * factor) - current_count)
 
         # Quick exit if no budget
         if budget_left <= 0:
@@ -474,7 +476,7 @@ class DefaultStrategy(Strategy):
         relocate(
             params=params,
             optimizers=optimizers,
-            state={},
+            state=state,
             mask=dead_mask,
             binoms=binoms,
             min_opacity=min_opacity,

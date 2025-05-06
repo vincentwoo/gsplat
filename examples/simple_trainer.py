@@ -55,10 +55,10 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     #data_dir: str = "/home/paja/data/whz"
     #data_dir: str = "/home/paja/data/fasnacht"
-    data_dir: str = "/home/paja/data/bike_aliked"
+    #data_dir: str = "/home/paja/data/bike_aliked"
     #data_dir: str = "/media/paja/T7/vincent/car"
     #data_dir: str = "/media/paja/T7/vincent/pier90"
-    #data_dir: str = "/media/paja/T7/vincent/sutro"
+    data_dir: str = "/media/paja/T7/vincent/sutro"
     #data_dir: str = "/media/paja/T7/vincent/natanya"
     #data_dir: str = "/media/paja/T7/vincent/pier90_gallery"
     #Downsample factor for the dataset
@@ -385,9 +385,6 @@ def create_splats_with_optimizers(
             points = points[indices]
             rgbs = rgbs[indices]
             print(f"Downsampling from {initial_number} to {selection}")
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
@@ -410,8 +407,8 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("w", torch.nn.Parameter(w), 0.0002 * scene_scale),
+        ("means", torch.nn.Parameter(points), 1.6e-5 * scene_scale),
+        ("w", torch.nn.Parameter(w), 0.00005 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
