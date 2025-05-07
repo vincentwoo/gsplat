@@ -78,8 +78,8 @@ class DefaultStrategy(Strategy):
     """
 
     prune_opa: float = 0.005
-    grow_grad2d: float = 0.0002
-    grow_scale3d: float = 0.001
+    grow_grad2d: float = 0.00012
+    grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
     noise_lr: float = 5e5
@@ -88,11 +88,11 @@ class DefaultStrategy(Strategy):
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 1_500
     refine_stop_iter: int = 55_000
-    max_budget: int = 4_000_000 # set -1 to disable.
+    max_budget: int = 10_000_000 # set -1 to disable.
     reset_every: int = 6000
     refine_every: int = 200
     pause_refine_after_reset: int = 0
-    absgrad: bool = True
+    absgrad: bool = False
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
