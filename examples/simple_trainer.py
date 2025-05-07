@@ -208,6 +208,21 @@ class Config:
             assert_never(strategy)
 
 
+# https://arxiv.org/pdf/2406.11672
+# Effective Rank Analysis and Regularization for Enhanced 3D Gaussian Splatting
+def get_effective_rank(scale, temp=1):
+    D = (scale*scale)**(1/temp)
+    _sum = D.sum(dim=1, keepdim=True)
+    pD = D / _sum
+    try:
+        entropy = -torch.sum(pD*torch.log(pD), dim=1)
+        erank = torch.exp(entropy) 
+    except Exception as e:
+        print(e)
+        pass
+    return erank
+
+
 def axis_angle_to_matrix(axis_angle):
     """
     Converts an axis-angle rotation of shape [B, 3]
@@ -923,6 +938,10 @@ class Runner:
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            scale = self.splats["scales"]
+            erank = get_effective_rank(scale)
+            erank_loss = torch.clamp(-torch.log(erank - 1 + 1e-7), 0).mean()
+            loss = loss + erank_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
