@@ -397,11 +397,10 @@ def create_splats_with_optimizers(
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
         if downscale and points.shape[0] > downscale_init_points:
             initial_number = points.shape[0]
-            selection = int(initial_number * 0.5)
-            indices = torch.randperm(points.shape[0])[:selection]
+            indices = torch.randperm(points.shape[0])[:downscale_init_points]
             points = points[indices]
             rgbs = rgbs[indices]
-            print(f"Downsampling from {initial_number} to {selection}")
+            print(f"Downsampling from {initial_number} to {downscale_init_points}")
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
