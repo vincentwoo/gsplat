@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Union
 
 import torch
@@ -85,6 +85,11 @@ class DefaultStrategy(Strategy):
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
     refine_stop_iter: int = 15_000
+    sparsity_steps: int = 15_000
+    init_rho: float = 0.0005
+    prune_ratio: float = 0.8
+    u: torch.Tensor = field(default=None, init=False)
+    z: torch.Tensor = field(default=None, init=False)
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0
@@ -156,10 +161,43 @@ class DefaultStrategy(Strategy):
         state: Dict[str, Any],
         step: int,
         info: Dict[str, Any],
+        sparsify: bool = False,
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
         if step >= self.refine_stop_iter:
+            with torch.no_grad():
+                if sparsify and step < (self.refine_stop_iter + self.sparsity_steps) and step % 50 == 0:
+                    opacities = params["opacities"]
+                    def prune_z(z, prune_ratio):
+                        index = int(prune_ratio * len(z))
+                        z_sort, _ = torch.sort(z, 0)
+                        z_threshold = z_sort[index - 1]
+                        z_update = ((z > z_threshold) * z)
+                        return z_update
+                    if self.u is None and self.z is None:
+                        self.u = torch.zeros_like(opacities)
+                        self.z = opacities.clone().detach()
+                        z = opacities + self.u
+                        self.z = prune_z(z, self.prune_ratio)
+                    else:
+                        z = opacities + self.u
+                        self.z = prune_z(z, self.prune_ratio)
+                        self.u += opacities - self.z
+
+                if sparsify and step == (self.refine_stop_iter + self.sparsity_steps):
+                    opacities = torch.sigmoid(params["opacities"].flatten())
+
+                    n_prune = int(self.prune_ratio * opacities.shape[0])
+
+                    if n_prune > 0:
+                        _, prune_indices = torch.topk(opacities, k=n_prune, largest=False)
+
+                        is_prune = torch.zeros(opacities.shape[0], dtype=torch.bool, device=opacities.device)
+                        is_prune[prune_indices] = True
+
+                        remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+                    print(f"Sparsity prune: {n_prune}")
             return
 
         self._update_state(params, state, info, packed=packed)

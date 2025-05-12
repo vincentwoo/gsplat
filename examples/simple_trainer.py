@@ -53,7 +53,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "examples/data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -80,7 +80,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 40_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -145,6 +145,8 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # Sparsity
+    sparsity_reg: bool = True
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -714,6 +716,11 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
+            if cfg.sparsity_reg:
+                if self.cfg.strategy.refine_stop_iter < step < (self.cfg.strategy.refine_stop_iter + self.cfg.strategy.sparsity_steps):
+                    spa_loss = self.cfg.strategy.init_rho * (torch.norm(torch.sigmoid(self.splats["opacities"]) - self.cfg.strategy.z + self.cfg.strategy.u, p=2)) ** 2
+                    loss = loss + 0.5 * spa_loss
+
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -866,6 +873,7 @@ class Runner:
                     state=self.strategy_state,
                     step=step,
                     info=info,
+                    sparsify=self.cfg.sparsity_reg,
                     packed=cfg.packed,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
@@ -876,6 +884,7 @@ class Runner:
                     step=step,
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
+                    sparsify=self.cfg.sparsity_reg,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1212,6 +1221,9 @@ if __name__ == "__main__":
         ),
     }
     cfg = tyro.extras.overridable_config_cli(configs)
+
+    if cfg.sparsity_reg:
+        cfg.max_steps =  40_000
     cfg.adjust_steps(cfg.steps_scaler)
 
     # try import extra dependencies

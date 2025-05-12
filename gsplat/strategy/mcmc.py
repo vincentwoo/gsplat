@@ -108,6 +108,7 @@ class MCMCStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         lr: float,
+        sparsify: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call.
 
