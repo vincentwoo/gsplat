@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import open3d as o3d
 import imageio
 import numpy as np
 import torch
@@ -210,6 +211,90 @@ class Config:
             assert_never(strategy)
 
 
+def load_splats_from_ply(
+    ply_file: str,
+    device: str = "cpu",
+) -> Dict[str, torch.Tensor]:
+    """
+    Load a .ply file.
+    """
+
+    print(f"Loading .ply from {ply_file}")
+    pcd = o3d.t.io.read_point_cloud(ply_file)
+    if pcd.is_empty():
+        raise ValueError(f"PLY file is empty or invalid: {ply_file}")
+
+    if not hasattr(pcd.point, "positions"):
+        raise ValueError("Missing 'positions' in PLY. Check your point cloud fields.")
+    means_ = pcd.point.positions.numpy()  # shape [N, 3]
+
+    scale_keys = [f"scale_{i}" for i in range(3)]
+    for k in scale_keys:
+        if k not in pcd.point:
+            raise ValueError(f"Missing '{k}' in PLY.")
+    scales_ = np.column_stack([pcd.point[k].numpy() for k in scale_keys])  # [N, 3]
+
+    rot_keys = [f"rot_{i}" for i in range(4)]
+    for k in rot_keys:
+        if k not in pcd.point:
+            raise ValueError(f"Missing '{k}' in PLY.")
+    quats_ = np.column_stack([pcd.point[k].numpy() for k in rot_keys])  # [N, 4]
+
+    if "opacity" not in pcd.point:
+        raise ValueError("Missing 'opacity' field in PLY.")
+    opacities_ = pcd.point["opacity"].numpy().reshape(-1)
+
+    dc_keys = sorted([k for k in pcd.point if k.startswith("f_dc_")],
+                     key=lambda x: int(x.split("_")[-1]))
+    if not dc_keys:
+        raise ValueError("No 'f_dc_*' fields found in PLY; cannot parse color or SH data.")
+    f_dc_list = [pcd.point[k].numpy() for k in dc_keys]  # each [N,]
+    f_dc_ = np.column_stack(f_dc_list)                   # shape [N, #f_dc_cols]
+
+    # Check for 'f_rest_*' → indicates SH
+    rest_keys = sorted([k for k in pcd.point if k.startswith("f_rest_")],
+                       key=lambda x: int(x.split("_")[-1]))
+    if not rest_keys:
+        colors_ = 0.5 + 0.2820947917738781 * f_dc_
+        splats_dict = {
+            "means":     torch.from_numpy(means_).float().to(device),
+            "scales":    torch.from_numpy(scales_).float().to(device),
+            "quats":     torch.from_numpy(quats_).float().to(device),
+            "opacities": torch.from_numpy(opacities_).float().to(device),
+            "colors":    torch.from_numpy(colors_).float().to(device),
+        }
+    else:
+        f_rest_list = [pcd.point[k].numpy() for k in rest_keys]
+        f_rest_ = np.column_stack(f_rest_list)  # shape [N, #f_rest_cols]
+
+        N, dc_dim = f_dc_.shape
+        N2, rest_dim = f_rest_.shape
+        if N != N2:
+            raise ValueError(f"f_dc_ has {N} points but f_rest_ has {N2}. Mismatch!")
+        # f_dc_ => [N, B0*3]; reshape => [N, B0, 3]
+        if dc_dim % 3 != 0:
+            raise ValueError(f"f_dc_ shape {f_dc_.shape} not multiple of 3.")
+        B0 = dc_dim // 3
+        sh0_ = f_dc_.reshape(N, 3, B0).transpose(0, 2, 1)  # shape [N, B0, 3]
+
+        # For shN
+        if rest_dim % 3 != 0:
+            raise ValueError(f"f_rest_ shape {f_rest_.shape} not multiple of 3.")
+        Bn = rest_dim // 3
+        shN_ = f_rest_.reshape(N, 3, Bn).transpose(0, 2, 1)  # shape [N, Bn, 3]
+
+        splats_dict = {
+            "means":     torch.from_numpy(means_).float().to(device),
+            "scales":    torch.from_numpy(scales_).float().to(device),
+            "quats":     torch.from_numpy(quats_).float().to(device),
+            "opacities": torch.from_numpy(opacities_).float().to(device),
+            "sh0":       torch.from_numpy(sh0_).float().to(device),
+            "shN":       torch.from_numpy(shN_).float().to(device),
+        }
+
+    return splats_dict
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     splats,
@@ -344,11 +429,23 @@ class Runner:
         # Model
         feature_dim = 32 if cfg.app_opt else None
 
-        ckpts = [
-            torch.load(file, map_location=self.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
+        ckpts = []
+        for file_path in cfg.ckpt or []:
+            if file_path.endswith(".ply"):
+                # read from .ply
+                splats_dict = load_splats_from_ply(file_path, device=self.device)
+                ckpts.append({"splats": splats_dict})
+            else:
+                # read from .pt
+                c = torch.load(file_path, map_location=self.device)
+                ckpts.append(c)
+
+        if not ckpts:
+            raise ValueError("No ckpt/.ply input was provided.")
+
+        # Splats from the first file
         splat = ckpts[0]["splats"]
+
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             splat,
