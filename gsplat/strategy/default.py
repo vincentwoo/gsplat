@@ -88,8 +88,6 @@ class DefaultStrategy(Strategy):
     sparsity_steps: int = 15_000
     init_rho: float = 0.0005
     prune_ratio: float = 0.8
-    u: torch.Tensor = field(default=None, init=False)
-    z: torch.Tensor = field(default=None, init=False)
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0
