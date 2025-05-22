@@ -178,6 +178,11 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # downscale
+    downscale: bool = True
+    # downscale_init
+    downscale_init_points: int = 500_000
+
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # 3DGUT (uncented transform + eval 3D)
@@ -226,6 +231,8 @@ def create_splats_with_optimizers(
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
+    downscale: bool = False,
+    downscale_init_points: int = 500_000,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
     world_rank: int = 0,
@@ -239,6 +246,13 @@ def create_splats_with_optimizers(
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
+
+    if downscale and points.shape[0] > downscale_init_points:
+        initial_number = points.shape[0]
+        indices = torch.randperm(points.shape[0])[:downscale_init_points]
+        points = points[indices]
+        rgbs = rgbs[indices]
+        print(f"Downsampling from {initial_number} to {downscale_init_points}")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -365,6 +379,8 @@ class Runner:
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
+            downscale=cfg.downscale,
+            downscale_init_points=cfg.downscale_init_points,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
@@ -448,7 +464,7 @@ class Runner:
             self.bil_grid_optimizers = [
                 torch.optim.Adam(
                     self.bil_grids.parameters(),
-                    lr=2e-3 * math.sqrt(cfg.batch_size),
+                    lr=2e-4 * math.sqrt(cfg.batch_size),
                     eps=1e-15,
                 ),
             ]
@@ -646,6 +662,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -933,6 +950,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -1053,6 +1071,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1117,8 +1136,7 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
-            / 255.0,
+            backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
