@@ -186,6 +186,11 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # downscale
+    downscale: bool = True
+    # downscale_init
+    downscale_init_points: int = 500_000
+
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # Whether use fused-bilateral grid
@@ -397,19 +402,23 @@ def create_splats_with_optimizers(
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-        if downscale and points.shape[0] > downscale_init_points:
-            initial_number = points.shape[0]
-            indices = torch.randperm(points.shape[0])[:downscale_init_points]
-            points = points[indices]
-            rgbs = rgbs[indices]
-            print(f"Downsampling from {initial_number} to {downscale_init_points}")
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
     dists = torch.linalg.norm(points, dim=1)  # Euclidean ‖(x,y,z)‖
-    keep_mask = dists <= 400
+    filter_dist = 100
+    keep_mask = dists <= filter_dist
+    orig_len = len(points)
     points = points[keep_mask]
     rgbs = rgbs[keep_mask]
+    print(f"Dropping {orig_len - len(points)} points further than {filter_dist} away")
+
+    if downscale and points.shape[0] > downscale_init_points:
+        initial_number = points.shape[0]
+        indices = torch.randperm(points.shape[0])[:downscale_init_points]
+        points = points[indices]
+        rgbs = rgbs[indices]
+        print(f"Downsampling from {initial_number} to {downscale_init_points}")
 
     _, w, r = xyz_to_polar(points)
     points *=  w.unsqueeze(1)
@@ -641,6 +650,8 @@ class Runner:
             ]
             if world_size > 1:
                 self.exposure_module = DDP(self.exposure_module)
+
+        self.backgrounds = torch.tensor([(0.81960784, 0.91372549, 0.97254902)], device=self.device)
 
         self.pose_refiner_optimizers = []
         if cfg.use_global_mlp_refiner:
@@ -916,6 +927,7 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 importance=importance,
+                backgrounds=self.backgrounds,
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -1254,6 +1266,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                backgrounds=self.backgrounds,
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -1374,6 +1387,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                backgrounds=self.backgrounds,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1438,8 +1452,7 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
-            / 255.0,
+            backgrounds=self.backgrounds,
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
