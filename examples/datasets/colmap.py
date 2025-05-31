@@ -37,7 +37,7 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
     for image_file in tqdm(image_files):
         image_path = os.path.join(image_dir, image_file)
         resized_path = os.path.join(
-            resized_dir, os.path.splitext(image_file)[0] + ".png"
+            resized_dir, os.path.splitext(image_file)[0] + ".jpg"
         )
         if os.path.isfile(resized_path):
             continue
@@ -49,7 +49,7 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
         resized_image = np.array(
             Image.fromarray(image).resize(resized_size, Image.BICUBIC)
         )
-        imageio.imwrite(resized_path, resized_image)
+        imageio.imwrite(resized_path, resized_image, quality=95)
     return resized_dir
 
 
@@ -186,15 +186,29 @@ class Parser:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
 
+        # Mask directory logic
+        if factor > 1 and not self.extconf["no_factor_suffix"]:
+            mask_dir_suffix = f"_{factor}"
+        else:
+            mask_dir_suffix = ""
+        
+        mask_dir_scaled = os.path.join(data_dir, "masks" + mask_dir_suffix)
+        mask_dir_base = os.path.join(data_dir, "masks")
+        
+        self.mask_dir = None
+        if os.path.exists(mask_dir_scaled):
+            self.mask_dir = mask_dir_scaled
+            print(f"[Parser] Using mask directory: {self.mask_dir}")
+        elif os.path.exists(mask_dir_base):
+            self.mask_dir = mask_dir_base
+            print(f"[Parser] Using mask directory: {self.mask_dir}")
+        else:
+            print(f"[Parser] Warning: Mask directory not found. Tried {mask_dir_scaled} and {mask_dir_base}. Proceeding without custom masks.")
+
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
-            image_dir = _resize_image_folder(
-                colmap_image_dir, image_dir + "_png", factor=factor
-            )
-            image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
@@ -272,6 +286,50 @@ class Parser:
             width, height = self.imsize_dict[camera_id]
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
+        # Load custom masks
+        if self.mask_dir is not None:
+            loaded_mask_count = 0
+            for i, image_name in enumerate(self.image_names):
+                camera_id = self.camera_ids[i]
+                img_basename = os.path.splitext(image_name)[0]
+                # TODO: Make mask extension more flexible if needed. Assuming .png for now.
+                mask_fname = img_basename + ".jpg.png"
+                mask_path = os.path.join(self.mask_dir, mask_fname)
+                # print(img_basename, mask_fname, mask_path)
+                # exit()
+
+                if os.path.exists(mask_path):
+                    try:
+                        mask_data = imageio.imread(mask_path)
+                        # Ensure mask is 2D (binary)
+                        if mask_data.ndim == 3:
+                            if mask_data.shape[2] == 1: # Grayscale
+                                mask_data = mask_data[..., 0]
+                            elif mask_data.shape[2] in [3, 4]: # RGB or RGBA, take first channel or luminance
+                                print(f"[Parser] Warning: Mask {mask_fname} has {mask_data.shape[2]} channels. Using first channel.")
+                                mask_data = mask_data[..., 0]
+                            else:
+                                print(f"[Parser] Warning: Mask {mask_fname} has unexpected shape {mask_data.shape}. Skipping.")
+                                continue
+                        
+                        # Convert to boolean
+                        mask_bool = (mask_data > 0).astype(bool) # Assuming non-zero pixels are True
+
+                        # Check dimensions
+                        expected_h, expected_w = self.imsize_dict[camera_id][1], self.imsize_dict[camera_id][0]
+                        if mask_bool.shape[0] == expected_h and mask_bool.shape[1] == expected_w:
+                            self.mask_dict[camera_id] = mask_bool
+                            loaded_mask_count += 1
+                        else:
+                            print(f"[Parser] Warning: Mask {mask_fname} dimensions ({mask_bool.shape[0]}H x {mask_bool.shape[1]}W) "
+                                  f"do not match image dimensions ({expected_h}H x {expected_w}W). Skipping this mask.")
+                    except Exception as e:
+                        print(f"[Parser] Error loading mask {mask_path}: {e}")
+                else:
+                    print(f"[Parser] Mask not found for {image_name} at {mask_path}")
+            # if loaded_mask_count > 0:
+            print(f"[Parser] Successfully loaded {loaded_mask_count} custom masks.")
+        
         # undistortion
         self.mapx_dict = dict()
         self.mapy_dict = dict()
@@ -323,6 +381,20 @@ class Parser:
                     np.logical_and(mapx > 0, mapy > 0),
                     np.logical_and(mapx < width - 1, mapy < height - 1),
                 )
+
+                # 'mask' (calculated by line 386) is the full-size geometric fisheye mask.
+                # Check if a custom mask was loaded earlier for this camera_id.
+                custom_mask_for_cam = self.mask_dict.get(camera_id)
+
+                if custom_mask_for_cam is not None:
+                    # A custom mask exists. Combine it with the geometric fisheye mask
+                    # using a logical AND. Both masks are boolean and should have the
+                    # same dimensions as the image at this point.
+                    self.mask_dict[camera_id] = custom_mask_for_cam & mask
+                else:
+                    # No custom mask was loaded. Use only the geometric fisheye mask.
+                    self.mask_dict[camera_id] = mask
+
                 y_indices, x_indices = np.nonzero(mask)
                 y_min, y_max = y_indices.min(), y_indices.max() + 1
                 x_min, x_max = x_indices.min(), x_indices.max() + 1
