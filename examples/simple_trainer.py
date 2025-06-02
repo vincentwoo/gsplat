@@ -81,10 +81,8 @@ class Config:
 
     # Number of training steps
     max_steps: int = 30_000
-    # Sparsify steps
-    sparsify_steps: int = 60_000
     init_rho: float = 0.0005
-    prune_ratio: float = 0.8
+    prune_ratio: float = 0.65
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 40_000])
     # Whether to save ply file (storage size can be large)
@@ -299,6 +297,25 @@ def load_splats_from_ply(
             "shN":       torch.from_numpy(shN_).float().to(device),
         }
 
+    # ------------------------------------------------------------------
+    # >>> Filter out points whose center lies within radius ≤ 1.85 m <<<
+    # ------------------------------------------------------------------
+    means_tensor = splats_dict["means"]                     # [N, 3] on chosen device
+    dists         = torch.linalg.norm(means_tensor, dim=1)  # Euclidean ‖(x,y,z)‖
+    keep_mask     = dists <= 400                            # keep points inside sphere
+
+    # If everything was filtered out, let the caller know right away
+    if not torch.any(keep_mask):
+        raise ValueError(
+            "All points were removed by the radius-1.85 filter. "
+            "Consider lowering the threshold."
+        )
+
+    # Apply the same mask to every entry so array lengths stay in sync
+    for k in list(splats_dict.keys()):
+        splats_dict[k] = splats_dict[k][keep_mask]
+    # ------------------------------------------------------------------
+
     return splats_dict
 
 
@@ -387,6 +404,10 @@ def create_splats_with_optimizers(
 
     return splats, optimizers
 
+
+def range_penalty(t, limit):
+    excess = t.abs().add_(-limit).clamp_min_(0)   # one fused, in-place path
+    return 0.1 * excess.square_().mean()       # square_ & mean in place
 
 class Runner:
     """Engine for training and testing."""
@@ -754,7 +775,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -811,24 +832,22 @@ class Runner:
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-                )
+                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-                )
+                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            if 6000 < step < self.cfg.sparsify_steps:
+            sh0_loss = range_penalty(self.splats["sh0"], 2.0)
+            loss += sh0_loss
+            # shN_loss = range_penalty(self.splats["shN"], 3.0)
+            # loss += sh0_loss + shN_loss
+
+            if 10000 < step < (self.cfg.max_steps / 2):
                 spa_loss = self.cfg.init_rho * (torch.norm(torch.sigmoid(self.splats["opacities"]) - z + u, p=2)) ** 2
                 loss = loss + 0.5 * spa_loss
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| " f"sh0 {sh0_loss:.5e}| "# f"shN {shN_loss:.5e}"
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -941,13 +960,13 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
-            if 6000 < step < self.cfg.sparsify_steps and step % 100 == 0:
+            if 10000 < step < (self.cfg.max_steps / 2) and step % 100 == 0:
                 opa = torch.sigmoid(self.splats["opacities"].clone().detach())
                 z = opa + u
                 z = prune_z(z, self.cfg.prune_ratio)
                 u += opa - z
 
-            if step == self.cfg.sparsify_steps:
+            if step == (self.cfg.max_steps / 2):
                 opacities = torch.sigmoid(self.splats["opacities"].flatten())
 
                 n_prune = int(self.cfg.prune_ratio * opacities.shape[0])
@@ -1008,7 +1027,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -1129,7 +1148,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1194,7 +1213,7 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+            backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
