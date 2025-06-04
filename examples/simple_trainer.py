@@ -247,6 +247,14 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
+    dists = torch.linalg.norm(points, dim=1)  # Euclidean ‖(x,y,z)‖
+    filter_dist = 500
+    keep_mask = dists <= filter_dist
+    orig_len = len(points)
+    points = points[keep_mask]
+    rgbs = rgbs[keep_mask]
+    print(f"Dropping {orig_len - len(points)} points further than {filter_dist} away")
+
     if downscale and points.shape[0] > downscale_init_points:
         initial_number = points.shape[0]
         indices = torch.randperm(points.shape[0])[:downscale_init_points]
@@ -313,6 +321,9 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def range_penalty(t, limit):
+    excess = t.abs().add_(-limit).clamp_min_(0)   # one fused, in-place path
+    return 0.05 * excess.square_().mean()       # square_ & mean in place
 
 class Runner:
     """Engine for training and testing."""
@@ -464,7 +475,7 @@ class Runner:
             self.bil_grid_optimizers = [
                 torch.optim.Adam(
                     self.bil_grids.parameters(),
-                    lr=2e-4 * math.sqrt(cfg.batch_size),
+                    lr=2e-3 * math.sqrt(cfg.batch_size),
                     eps=1e-15,
                 ),
             ]
@@ -662,7 +673,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -950,7 +961,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -1071,7 +1082,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1136,7 +1147,7 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([(1.0, 1.0, 1.0)], device=self.device),
+            backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,

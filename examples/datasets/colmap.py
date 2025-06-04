@@ -293,7 +293,8 @@ class Parser:
                 camera_id = self.camera_ids[i]
                 img_basename = os.path.splitext(image_name)[0]
                 # TODO: Make mask extension more flexible if needed. Assuming .png for now.
-                mask_fname = img_basename + ".jpg.png"
+                # mask_fname = img_basename + ".jpg.png"
+                mask_fname = img_basename + ".png"
                 mask_path = os.path.join(self.mask_dir, mask_fname)
                 # print(img_basename, mask_fname, mask_path)
                 # exit()
