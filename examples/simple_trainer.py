@@ -302,7 +302,7 @@ def load_splats_from_ply(
     # ------------------------------------------------------------------
     means_tensor = splats_dict["means"]                     # [N, 3] on chosen device
     dists         = torch.linalg.norm(means_tensor, dim=1)  # Euclidean ‖(x,y,z)‖
-    keep_mask     = dists <= 400                            # keep points inside sphere
+    keep_mask     = dists <= 500                            # keep points inside sphere
 
     # If everything was filtered out, let the caller know right away
     if not torch.any(keep_mask):
@@ -571,6 +571,7 @@ class Runner:
                     eps=1e-15,
                 ),
             ]
+        self.backgrounds = torch.tensor([(0.81960784, 0.91372549, 0.97254902)], device=self.device)
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -775,7 +776,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
+                backgrounds=self.backgrounds,
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -1027,7 +1028,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
+                backgrounds=self.backgrounds,
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -1148,7 +1149,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
+                backgrounds=self.backgrounds,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1213,7 +1214,7 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([(0.8862745098039215, 0.9529411764705882, 0.9725490196078431)], device=self.device),
+            backgrounds=self.backgrounds,
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
