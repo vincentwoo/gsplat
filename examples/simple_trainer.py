@@ -1092,8 +1092,10 @@ class Runner:
                     sh0 = self.splats["sh0"]
                     shN = self.splats["shN"]
 
-                means = self.splats["means"]
-                scales = self.splats["scales"]
+                w_log = self.splats["w"].unsqueeze(1)
+                means = self.splats["means"] / torch.exp(w_log)
+                scales = self.splats["scales"] - w_log
+
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
                 export_splats(
