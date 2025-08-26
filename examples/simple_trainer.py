@@ -475,7 +475,7 @@ class Runner:
             self.bil_grid_optimizers = [
                 torch.optim.Adam(
                     self.bil_grids.parameters(),
-                    lr=2e-3 * math.sqrt(cfg.batch_size),
+                    lr=2e-4 * math.sqrt(cfg.batch_size),
                     eps=1e-15,
                 ),
             ]
