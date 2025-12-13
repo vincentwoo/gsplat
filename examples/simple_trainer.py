@@ -172,6 +172,11 @@ class Config:
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
+    # Exposure
+    use_exposure: bool = True
+    # Exposure learning rate
+    exposure_lr: float = 1e-3
+
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
@@ -214,6 +219,45 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+class ExposureModule(torch.nn.Module):
+    def __init__(self, num_images):
+        super().__init__()
+        # exposure: shape [num_images, 3, 4]
+        self.exposure = torch.nn.Parameter(
+            torch.eye(3, 4, device="cuda")
+            .unsqueeze(0)
+            .repeat(num_images, 1, 1)
+        )
+
+    def forward(self, rendered_colors: torch.Tensor, image_ids: torch.Tensor):
+        """
+        Args:
+          rendered_colors: shape [B, H, W, 3]
+          image_ids:       shape [B] (each entry is the index for which exposure to use)
+        Returns:
+          The exposed colors, same shape [B, H, W, 3].
+        """
+
+        batch_exposures = self.exposure[image_ids]  # shape [B, 3, 4]
+
+        # 2) Flatten [B, H, W, 3] -> [B, H*W, 3]
+        B, H, W, C = rendered_colors.shape
+        colors_2d = rendered_colors.view(B, H * W, C)  # shape [B, H*W, 3]
+
+        # Separate out the linear part (3×3) and bias (3×1)
+        linear = batch_exposures[:, :, :3]  # shape [B, 3, 3]
+        bias   = batch_exposures[:, :, 3]   # shape [B, 3]
+
+        # 3) Batch multiply each pixel by the 3×3, then add the bias
+        # [B, H*W, 3] x [B, 3, 3] => [B, H*W, 3]
+        colors_2d = torch.bmm(colors_2d, linear.transpose(1, 2))
+
+        colors_2d = colors_2d + bias.unsqueeze(1)  # shape [B, 1, 3]
+
+        # 5) Reshape back to [B, H, W, 3]
+        exposed = colors_2d.view(B, H, W, 3)
+        return exposed
 
 
 def load_splats_from_ply(
@@ -573,6 +617,22 @@ class Runner:
             ]
         self.backgrounds = torch.tensor([(0.81960784, 0.91372549, 0.97254902)], device=self.device)
 
+        self.exposure_optimizers = []
+        if cfg.use_exposure:
+            # Wrap the exposure parameter in a module
+            self.exposure_module = ExposureModule(len(self.trainset.indices)).to(self.device)
+
+            # Create the optimizer from the module’s parameters
+            self.exposure_optimizers = [
+                torch.optim.Adam(
+                    self.exposure_module.parameters(),
+                    lr=cfg.exposure_lr * math.sqrt(cfg.batch_size),
+                )
+            ]
+            if world_size > 1:
+                self.exposure_module = DDP(self.exposure_module)
+
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -660,6 +720,8 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
+        if self.cfg.use_exposure and image_ids is not None:
+            render_colors = self.exposure_module(render_colors, image_ids)
         return render_colors, render_alphas, info
 
     def sparsify(self):
@@ -703,6 +765,12 @@ class Runner:
                             self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                         ),
                     ]
+                )
+            )
+        if cfg.use_exposure:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.exposure_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
 
@@ -837,8 +905,8 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            sh0_loss = range_penalty(self.splats["sh0"], 2.0)
-            loss += sh0_loss
+            # sh0_loss = range_penalty(self.splats["sh0"], 2.0)
+            # loss += sh0_loss
             # shN_loss = range_penalty(self.splats["shN"], 3.0)
             # loss += sh0_loss + shN_loss
 
@@ -848,7 +916,7 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| " f"sh0 {sh0_loss:.5e}| "# f"shN {shN_loss:.5e}"
+            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "# f"sh0 {sh0_loss:.5e}| "# f"shN {shN_loss:.5e}"
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -956,6 +1024,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.exposure_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
