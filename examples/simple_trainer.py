@@ -191,6 +191,9 @@ class Config:
     # downscale_init
     downscale_init_points: int = 500_000
 
+    # clamp spherical harmonics
+    clamp_sh: bool = False
+
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # Whether use fused-bilateral grid
@@ -1139,6 +1142,14 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            if cfg.clamp_sh:
+                with torch.no_grad():
+                    if "sh0" in self.splats:
+                        self.splats["sh0"].clamp_(-1.7724538509, 1.7724538509)
+                    if "shN" in self.splats:
+                        self.splats["shN"].clamp_(-1.7724538509, 1.7724538509)
+
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
