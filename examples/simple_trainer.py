@@ -530,9 +530,18 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
-        num_train_imgs = len(self.trainset)
-        self.image_loss_sums = [0.0 for _ in range(num_train_imgs)]
-        self.image_loss_counts = [0 for _ in range(num_train_imgs)]
+
+        # Uniform sampling with down-weighted Air 3S frames.
+        # Dataset items map to original COLMAP image indices via trainset.indices (see datasets/colmap.py).
+        self.air3s_prefix = "air3s-"
+        self.air3s_weight_factor = 0.5  # sample ~50% less often than other frames
+        train_image_names = [
+            os.path.basename(self.parser.image_names[gi]) for gi in self.trainset.indices
+        ]
+        self.air3s_mask = torch.tensor(
+            [n.startswith(self.air3s_prefix) for n in train_image_names],
+            dtype=torch.bool,
+        )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -778,7 +787,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        update_steps = [max_steps // 2, (3 * max_steps) // 4]
+        update_steps = [max_steps // 2]
         init_step = 0
 
         uniform_loader = torch.utils.data.DataLoader(
@@ -791,9 +800,28 @@ class Runner:
         )
         uniform_iter = iter(uniform_loader)
 
-        # Weighted loader starts as None; we will build it at step >= half_steps
-        weighted_loader = None
-        weighted_iter = None
+        # Uniform base weights; down-weight Air 3S images by a fixed factor.
+        weights = torch.ones(len(self.trainset), dtype=torch.float32)
+        if hasattr(self, "air3s_mask") and self.air3s_mask.numel() == weights.numel():
+            weights = weights * torch.where(self.air3s_mask, self.air3s_weight_factor, 1.0)
+        # Guard against all-zero weights (shouldn't happen, but keep sampler robust).
+        if float(weights.sum()) <= 0.0:
+            weights = torch.ones_like(weights)
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(self.trainset),
+            replacement=True
+        )
+        weighted_loader = torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=cfg.batch_size,
+            sampler=sampler,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+        weighted_iter = iter(weighted_loader)
 
         schedulers = [
             # means has a learning rate schedule, that ends at 0.01 of the initial value
@@ -839,7 +867,8 @@ class Runner:
 
         global_tic = time.time()
 
-        current_loader = "uniform"
+        # current_loader = "uniform"
+        current_loader = "weighted"
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -851,32 +880,7 @@ class Runner:
             self.trainset.update_step(step)
 
             if step in update_steps:
-                # Rebuild weighted loader at these steps
-                image_loss_sums_t = torch.tensor(self.image_loss_sums, dtype=torch.float32)
-                image_loss_counts_t = torch.tensor(self.image_loss_counts, dtype=torch.float32)
-                avg_loss = image_loss_sums_t / (image_loss_counts_t + 1e-8)
-                total_loss = float(avg_loss.sum())
-                weights = avg_loss / total_loss if total_loss >= 1e-8 else torch.ones_like(avg_loss)
-
-                sampler = torch.utils.data.WeightedRandomSampler(
-                    weights=weights,
-                    num_samples=len(self.trainset),
-                    replacement=True
-                )
-                weighted_loader = torch.utils.data.DataLoader(
-                    self.trainset,
-                    batch_size=cfg.batch_size,
-                    sampler=sampler,
-                    num_workers=4,
-                    persistent_workers=True,
-                    pin_memory=True,
-                )
-                weighted_iter = iter(weighted_loader)
                 current_loader = "weighted"
-
-                num_train_imgs = len(self.trainset)
-                self.image_loss_sums = [0.0] * num_train_imgs
-                self.image_loss_counts = [0] * num_train_imgs
                 # Select the loader based on current_loader
             if current_loader == "uniform":
                 try:
@@ -1023,12 +1027,6 @@ class Runner:
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
-
-            loss_val = loss.detach().item()
-            for idx in image_ids:
-                idx_cpu = idx.item()
-                self.image_loss_sums[idx_cpu] += loss_val
-                self.image_loss_counts[idx_cpu] += 1
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
