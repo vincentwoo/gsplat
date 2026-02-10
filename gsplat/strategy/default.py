@@ -205,19 +205,19 @@ class DefaultStrategy(Strategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
-        if step % self.reset_every == 0 and self.refine_start_iter <= step < self.refine_stop_iter:
-            # Apply logit to current opacities
-            # Mask for pruning in logit space
-            threshold = 2.0 * self.prune_opa
-            mask = state["importance"] < threshold
-            n_prune = mask.sum().item()
+        # if step % self.reset_every == 0 and self.refine_start_iter <= step < self.refine_stop_iter:
+        #     # Apply logit to current opacities
+        #     # Mask for pruning in logit space
+        #     threshold = 2.0 * self.prune_opa
+        #     mask = state["importance"] < threshold
+        #     n_prune = mask.sum().item()
 
-            # Prune
-            if n_prune > 0:
-                self.prune_mask(params, optimizers, state, mask)
+        #     # Prune
+        #     if n_prune > 0:
+        #         self.prune_mask(params, optimizers, state, mask)
 
-            state["importance"].zero_()
-            print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
+        #     state["importance"].zero_()
+        #     print(f"Pruning {n_prune} GSs with opacity below {threshold:.2f}.")
 
         if (self.refine_start_iter < step < self.refine_stop_iter):
             inject_noise_to_position(

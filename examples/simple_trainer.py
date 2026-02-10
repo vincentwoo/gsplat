@@ -1178,12 +1178,12 @@ class Runner:
                     lr=schedulers[0].get_last_lr()[0],
                     packed=cfg.packed,
                 )
-                if step == self.cfg.strategy.refine_stop_iter:
-                    importance_mask = self.importance_score()
-                    self.cfg.strategy.prune_mask(params=self.splats,
-                                                 optimizers=self.optimizers,
-                                                 state=self.strategy_state,
-                                                 mask=importance_mask)
+                # if step == self.cfg.strategy.refine_stop_iter:
+                #     importance_mask = self.importance_score()
+                #     self.cfg.strategy.prune_mask(params=self.splats,
+                #                                  optimizers=self.optimizers,
+                #                                  state=self.strategy_state,
+                #                                  mask=importance_mask)
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
