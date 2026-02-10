@@ -867,8 +867,8 @@ class Runner:
 
         global_tic = time.time()
 
-        # current_loader = "uniform"
-        current_loader = "weighted"
+        current_loader = "uniform"
+        # current_loader = "weighted"
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
